@@ -1,0 +1,268 @@
+{
+  "name": "PolarProcess",
+  "_meta": {
+    "schema_version": "1.0",
+    "last_synced_at": "2026-06-10T00:00:00+08:00"
+  },
+  "description": "Process lifecycle management, resource scheduling, and system profiling — migrated from SOTAgent's process-manager + scheduler + profiler + command-guard + tailscale-client modules.",
+  "tier": "service",
+  "status": "active",
+  "version": "0.1.0",
+  "requirements": [
+    {
+      "id": "R1",
+      "need": "进程启停/健康检查/远程转发 — 管理服务全生命周期",
+      "approach": "Hono server 挂载 /api/services/* + /api/processes/* 端点，sqlite 持久化进程状态，定时健康检查",
+      "tech": {
+        "Hono": "4",
+        "better-sqlite3": "12"
+      },
+      "features": [
+        {
+          "name": "GET /api/services",
+          "status": "done",
+          "interfaces": [
+            "GET /api/services → IProcessStatus[]"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/services/:id/start",
+          "status": "done",
+          "interfaces": [
+            "POST /api/services/:id/start → IServiceActionResult"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/services/:id/stop",
+          "status": "done",
+          "interfaces": [
+            "POST /api/services/:id/stop → IServiceActionResult"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/services/:id/restart",
+          "status": "done",
+          "interfaces": [
+            "POST /api/services/:id/restart → IServiceActionResult"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "GET /api/processes",
+          "status": "done",
+          "interfaces": [
+            "GET /api/processes → IProcessStatus[]"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "GET /api/processes/:id",
+          "status": "done",
+          "interfaces": [
+            "GET /api/processes/:id → IProcessStatus"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/processes/:id/kill",
+          "status": "done",
+          "interfaces": [
+            "POST /api/processes/:id/kill → { ok, message }"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "R2",
+      "need": "重任务队列/分时复用 — 资源调度器管理后台任务",
+      "approach": "ResourceScheduler 管理重任务队列，检测系统空闲窗口，资源紧张时暂停任务",
+      "features": [
+        {
+          "name": "GET /api/tasks",
+          "status": "done",
+          "interfaces": [
+            "GET /api/tasks → IHeavyTaskRow[]"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/tasks/create",
+          "status": "done",
+          "interfaces": [
+            "POST /api/tasks/create → { ok, task_id }"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/tasks/:id/cancel",
+          "status": "done",
+          "interfaces": [
+            "POST /api/tasks/:id/cancel → { ok }"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "GET /api/tasks/:id/status",
+          "status": "done",
+          "interfaces": [
+            "GET /api/tasks/:id/status → IHeavyTaskRow"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "GET /api/scheduler/status",
+          "status": "done",
+          "interfaces": [
+            "GET /api/scheduler/status → { idle, running_tasks, queue_depth }"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "GET /api/scheduler/queue",
+          "status": "done",
+          "interfaces": [
+            "GET /api/scheduler/queue → IHeavyTaskRow[]"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/scheduler/config",
+          "status": "done",
+          "interfaces": [
+            "POST /api/scheduler/config → { ok }"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "R3",
+      "need": "Watchdog 进程监控 — 自动检测+重启+crash loop 保护",
+      "approach": "Watchdog 定时健康检查所有项目的 health_endpoint，连续失败自动重启，重启耗尽发 lobster-event 触发 PolarPilot Agentic 自愈",
+      "features": [
+        {
+          "name": "GET /api/watchdog/status — 所有监控目标状态",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/watchdog/pause/:service — 暂停某服务监控",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "POST /api/watchdog/resume/:service — 恢复某服务监控",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "自动发现 polaris.json health_endpoint",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "连续 3 次失败自动重启",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "crash loop 检测（5 分钟内 5 次重启）",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        },
+        {
+          "name": "lobster-events.jsonl 事件输出",
+          "status": "done",
+          "evidence": [
+            "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "R4",
+      "need": "系统资源画像 — 通过观察进程积累资源使用画像",
+      "approach": "ResourceProfiler 采样进程 CPU/内存/GPU，逐步积累画像数据",
+      "features": []
+    }
+  ],
+  "tech": {
+    "Hono": "4",
+    "better-sqlite3": "12",
+    "TypeScript": "5"
+  },
+  "depends_on": [
+    {
+      "project": "PolarPort",
+      "reason": "启动时通过 PolarPort HTTP API 取端口（POST /api/allocate）",
+      "endpoint": "http://127.0.0.1:11050/api/allocate"
+    }
+  ],
+  "service_management": {
+    "install_command": "npm ci",
+    "start_command": "npm start",
+    "restart_command": "npm start",
+    "health_endpoint": "http://127.0.0.1:11055/api/health"
+  },
+  "contacts": [
+    "@beichenO2"
+  ]
+}

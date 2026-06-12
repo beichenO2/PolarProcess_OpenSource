@@ -1,0 +1,8 @@
+{
+  "endpoint": "POST /api/services/knowlever-serve/start",
+  "response": {
+    "ok": true,
+    "message": "Service knowlever-serve started",
+    "pid": 12345
+  }
+}

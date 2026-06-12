@@ -1,0 +1,10 @@
+{
+  "endpoint": "GET /api/scheduler/status",
+  "response": {
+    "idle": false,
+    "running_tasks": 1,
+    "queue_depth": 2,
+    "avg_cpu": 65,
+    "avg_mem": 48
+  }
+}

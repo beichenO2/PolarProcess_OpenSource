@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Scheduler API",
+  "description": "PolarProcess resource scheduler and heavy task queue endpoints.",
+  "definitions": {
+    "HeavyTask": {
+      "type": "object",
+      "required": ["task_id", "task_type", "status", "created_at"],
+      "properties": {
+        "task_id": { "type": "string" },
+        "task_type": { "type": "string" },
+        "status": { "type": "string", "enum": ["queued", "running", "paused", "done", "failed", "cancelled"] },
+        "priority": { "type": "number" },
+        "pid": { "type": ["number", "null"] },
+        "progress": { "type": "number" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+        "error": { "type": ["string", "null"] },
+        "estimated_cpu_percent": { "type": "number" },
+        "estimated_mem_mb": { "type": "number" }
+      }
+    },
+    "SchedulerStatus": {
+      "type": "object",
+      "required": ["idle", "running_tasks", "queue_depth"],
+      "properties": {
+        "idle": { "type": "boolean" },
+        "running_tasks": { "type": "number" },
+        "queue_depth": { "type": "number" },
+        "avg_cpu": { "type": "number" },
+        "avg_mem": { "type": "number" }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "GET /api/tasks",
+      "type": "object",
+      "properties": {
+        "response": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/HeavyTask" }
+        }
+      }
+    },
+    {
+      "title": "POST /api/tasks/create",
+      "type": "object",
+      "required": ["task_type", "command"],
+      "properties": {
+        "task_type": { "type": "string" },
+        "command": { "type": "string" },
+        "priority": { "type": "number" },
+        "work_dir": { "type": "string" },
+        "env": { "type": "object" }
+      }
+    },
+    {
+      "title": "GET /api/scheduler/status",
+      "type": "object",
+      "properties": {
+        "response": { "$ref": "#/definitions/SchedulerStatus" }
+      }
+    },
+    {
+      "title": "POST /api/scheduler/config",
+      "type": "object",
+      "properties": {
+        "max_concurrent": { "type": "number" },
+        "idle_threshold_cpu": { "type": "number" },
+        "idle_threshold_mem": { "type": "number" }
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "endpoint": "GET /api/services",
+  "response": [
+    {
+      "id": "knowlever-serve",
+      "name": "KnowLever Serve",
+      "status": "running",
+      "pid": 12345,
+      "port": 3500,
+      "device_id": "mac-studio",
+      "auto_start": true,
+      "restart_count": 0,
+      "max_restarts": 3,
+      "started_at": "2026-05-09T10:00:00.000Z",
+      "last_health_check": "2026-05-09T10:05:00.000Z",
+      "is_local": true
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "endpoint": "GET /api/tasks",
+  "response": [
+    {
+      "task_id": "task_abc123",
+      "task_type": "whisper-transcribe",
+      "status": "running",
+      "priority": 5,
+      "pid": 12350,
+      "progress": 45,
+      "created_at": "2026-05-09T10:00:00.000Z",
+      "started_at": "2026-05-09T10:01:00.000Z",
+      "finished_at": null,
+      "error": null,
+      "estimated_cpu_percent": 80,
+      "estimated_mem_mb": 4096
+    }
+  ]
+}

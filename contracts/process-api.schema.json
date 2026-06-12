@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Process API",
+  "description": "PolarProcess process lifecycle and service management endpoints.",
+  "definitions": {
+    "ProcessStatus": {
+      "type": "object",
+      "required": ["id", "name", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "status": { "type": "string", "enum": ["stopped", "starting", "running", "error"] },
+        "pid": { "type": ["number", "null"] },
+        "port": { "type": ["number", "null"] },
+        "device_id": { "type": "string" },
+        "auto_start": { "type": "boolean" },
+        "restart_count": { "type": "number" },
+        "max_restarts": { "type": "number" },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "last_health_check": { "type": ["string", "null"], "format": "date-time" },
+        "is_local": { "type": "boolean" }
+      }
+    },
+    "ServiceActionResult": {
+      "type": "object",
+      "required": ["ok", "message"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "message": { "type": "string" },
+        "pid": { "type": ["number", "null"] }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "GET /api/services",
+      "type": "object",
+      "properties": {
+        "response": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcessStatus" }
+        }
+      }
+    },
+    {
+      "title": "POST /api/services/:id/start",
+      "type": "object",
+      "properties": {
+        "response": { "$ref": "#/definitions/ServiceActionResult" }
+      }
+    },
+    {
+      "title": "GET /api/processes",
+      "type": "object",
+      "properties": {
+        "response": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProcessStatus" }
+        }
+      }
+    },
+    {
+      "title": "POST /api/processes/:id/kill",
+      "type": "object",
+      "required": ["ok", "message"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "message": { "type": "string" }
+      }
+    }
+  ]
+}
