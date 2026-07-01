@@ -183,6 +183,9 @@ export class ProcessManager {
    * Priority: DB start_script_dir → work_dir/Start/ auto-detection → null (legacy mode).
    */
   private resolveScriptDir(svc: ISharedServiceRow): string | null {
+    // Explicit opt-out: use legacy command mode (e.g. digist-engine vs digist-api Start/).
+    if (svc.start_script_dir === '-') return null;
+
     if (svc.start_script_dir) {
       const resolved = svc.start_script_dir.replace(/^~/, os.homedir());
       if (fs.existsSync(path.join(resolved, 'start.sh'))) return resolved;

@@ -49,11 +49,17 @@ do_start() {
         echo "Installing dependencies..."
         npm ci 2>&1 || npm install 2>&1
     fi
+    npm rebuild better-sqlite3 2>&1 || true
 
     LOG_FILE="$SCRIPT_DIR/polarprocess.log"
     NODE_BIN="$(which node)"
     TSX_BIN="$PROJECT_DIR/node_modules/.bin/tsx"
     echo "[start.sh] Using node: $NODE_BIN ($($NODE_BIN --version))" >> "$LOG_FILE"
+
+    if [ "${LAUNCHD:-}" = "1" ]; then
+        exec env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1
+    fi
+
     nohup env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1 &
     DAEMON_PID=$!
     echo "$DAEMON_PID" > "$PID_FILE"

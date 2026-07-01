@@ -110,7 +110,19 @@ export class ServiceDB {
       sets.push("restart_count_updated_at = datetime('now')");
     }
     if (extra?.pid != null) { sets.push('pid = ?'); vals.push(extra.pid); }
-    if (extra?.port != null) { sets.push('port = ?'); vals.push(extra.port); }
+    if (extra?.port != null) {
+      const portOwner = this.db.prepare(
+        'SELECT id FROM shared_services WHERE port = ? AND id != ? LIMIT 1'
+      ).get(extra.port, id) as { id: string } | undefined;
+      if (portOwner) {
+        console.warn(
+          `[ServiceDB] skip port update for ${id}: ${extra.port} already assigned to ${portOwner.id}`
+        );
+      } else {
+        sets.push('port = ?');
+        vals.push(extra.port);
+      }
+    }
     if (extra?.restart_count != null) {
       sets.push('restart_count = ?');
       vals.push(extra.restart_count);
