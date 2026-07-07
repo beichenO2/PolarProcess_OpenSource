@@ -154,6 +154,35 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): Hono {
     return c.json({ ok: true, message: `restart count reset for ${svc.name}` });
   });
 
+  app.post('/api/services/register', async (c) => {
+    const body = await c.req.json();
+    if (!body.id || !body.name || !body.command) {
+      return c.json({ ok: false, message: 'id, name and command are required' }, 400);
+    }
+    serviceDb.registerService(body);
+    return c.json({ ok: true, message: `service ${body.name} registered`, id: body.id });
+  });
+
+  app.post('/api/services/register-and-start', async (c) => {
+    const body = await c.req.json();
+    if (!body.id || !body.name || !body.command) {
+      return c.json({ ok: false, message: 'id, name and command are required' }, 400);
+    }
+    serviceDb.registerService(body);
+    const result = await pm.startService(body.id);
+    return c.json({ ...result, id: body.id }, result.ok ? 200 : 500);
+  });
+
+  // Backward compat: SOTAgent bridge proxies POST /api/services here
+  app.post('/api/services', async (c) => {
+    const body = await c.req.json();
+    if (!body.id || !body.name || !body.command) {
+      return c.json({ ok: false, message: 'id, name and command are required' }, 400);
+    }
+    serviceDb.registerService(body);
+    return c.json({ ok: true, message: `service ${body.name} registered`, id: body.id });
+  });
+
   // Start PM lifecycle loops
   pm.startHealthCheckLoop();
   pm.autoStartAll().then(started => {

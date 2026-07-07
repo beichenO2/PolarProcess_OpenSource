@@ -72,6 +72,57 @@ export class ServiceDB {
     return this.db.prepare('SELECT * FROM shared_services WHERE id = ?').get(id) as ISharedServiceRow | undefined;
   }
 
+  registerService(params: {
+    id: string;
+    name: string;
+    command: string;
+    work_dir?: string | null;
+    mem_requirement_mb?: number;
+    gpu_mem_requirement_mb?: number;
+    device_id?: string;
+    auto_start?: boolean;
+    restart_on_failure?: boolean;
+    max_restarts?: number;
+    port?: number | null;
+    health_check_url?: string | null;
+    cron_schedule?: string | null;
+    start_script_dir?: string | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO shared_services (id, name, command, work_dir, mem_requirement_mb, gpu_mem_requirement_mb, device_id, auto_start, restart_on_failure, max_restarts, port, health_check_url, cron_schedule, start_script_dir)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        command = excluded.command,
+        work_dir = excluded.work_dir,
+        mem_requirement_mb = excluded.mem_requirement_mb,
+        gpu_mem_requirement_mb = excluded.gpu_mem_requirement_mb,
+        device_id = excluded.device_id,
+        auto_start = excluded.auto_start,
+        restart_on_failure = excluded.restart_on_failure,
+        max_restarts = excluded.max_restarts,
+        port = COALESCE(excluded.port, port),
+        health_check_url = excluded.health_check_url,
+        cron_schedule = excluded.cron_schedule,
+        start_script_dir = excluded.start_script_dir
+    `).run(
+      params.id,
+      params.name,
+      params.command,
+      params.work_dir ?? null,
+      params.mem_requirement_mb ?? 0,
+      params.gpu_mem_requirement_mb ?? 0,
+      params.device_id ?? 'any',
+      params.auto_start ? 1 : 0,
+      params.restart_on_failure ? 1 : 0,
+      params.max_restarts ?? 3,
+      params.port ?? null,
+      params.health_check_url ?? null,
+      params.cron_schedule ?? null,
+      params.start_script_dir ?? null,
+    );
+  }
+
   listServices(deviceId?: string): ISharedServiceRow[] {
     if (deviceId) {
       return this.db.prepare(
