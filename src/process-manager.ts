@@ -139,10 +139,43 @@ export class ProcessManager {
    * Returns an error message if the port is allocated to a different service, null if OK.
    * Non-blocking: 1.5s timeout, graceful degradation on any failure.
    */
-  private async verifyPortWithPolarPort(svc: ISharedServiceRow): Promise<string | null> {
-    const polarportUrl = process.env.POLARPORT_URL ?? 'http://127.0.0.1:11050';
+  private polarPortUrl(): string {
+    return process.env.POLARPORT_URL ?? 'http://127.0.0.1:11050';
+  }
+
+  /**
+   * Allocate a port via PolarPort (sole port authority). Never use local ServiceDB.allocatePort.
+   */
+  private async claimPortFromPolarPort(params: {
+    service_name: string;
+    project: string;
+    preferred_port?: number | null;
+  }): Promise<number | null> {
     try {
-      const resp = await fetch(`${polarportUrl}/api/allocate`, {
+      const body: Record<string, unknown> = {
+        service_name: params.service_name,
+        project: params.project,
+      };
+      if (params.preferred_port != null && params.preferred_port > 0) {
+        body.preferred_port = params.preferred_port;
+      }
+      const resp = await fetch(`${this.polarPortUrl()}/api/allocate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json() as { ok?: boolean; port?: number };
+      return typeof data.port === 'number' ? data.port : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async verifyPortWithPolarPort(svc: ISharedServiceRow): Promise<string | null> {
+    try {
+      const resp = await fetch(`${this.polarPortUrl()}/api/allocate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1380,18 +1413,16 @@ export class ProcessManager {
       return { ok: false, message: `端口 ${port} 被第三方占用且服务 ${serviceId} 不存在` };
     }
 
-    const newPort = this.db.allocatePort({
-      service_name: svc.name,
-      project: 'sotagent-managed',
-      device_id: this.localDeviceId,
-      range_start: port + 5 - (port % 5 || 5),
-      range_end: Math.min(port + 200, 9995),
+    const newPort = await this.claimPortFromPolarPort({
+      service_name: svc.id || svc.name,
+      project: this.resolveProject(svc),
+      preferred_port: null,
     });
 
     if (!newPort) {
       return {
         ok: false,
-        message: `端口 ${port} 被第三方占用 (pid=${occupant.pid}, cmd=${occupant.command.slice(0, 80)})，且附近无可用端口`,
+        message: `端口 ${port} 被第三方占用 (pid=${occupant.pid}, cmd=${occupant.command.slice(0, 80)})，且 PolarPort 无可用端口`,
       };
     }
 
@@ -1493,16 +1524,14 @@ export class ProcessManager {
       return true;
     }
 
-    const newPort = this.db.allocatePort({
-      service_name: svc.name,
-      project: 'sotagent-managed',
-      device_id: this.localDeviceId,
-      range_start: svc.port + 5 - (svc.port % 5 || 5),
-      range_end: Math.min(svc.port + 200, 9995),
+    const newPort = await this.claimPortFromPolarPort({
+      service_name: svc.id || svc.name,
+      project: this.resolveProject(svc),
+      preferred_port: null,
     });
 
     if (!newPort) {
-      console.error(`[Watchdog] 端口 ${svc.port} 被第三方占用，附近无可用端口，${svc.name} 无法迁移`);
+      console.error(`[Watchdog] 端口 ${svc.port} 被第三方占用，PolarPort 无可用端口，${svc.name} 无法迁移`);
       return false;
     }
 
