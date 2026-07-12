@@ -4,15 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PID_FILE="$SCRIPT_DIR/.pid"
-SERVICE_NAME="polar-process"
-PROJECT="PolarProcess"
-PREFERRED_PORT=11055
+# Infrastructure service: port is pinned (launchd POLARPROCESS_PORT or 11055).
+# Do NOT call PolarPort claim_port — sticky registry previously rebound us to 8000/8030.
+PORT="${POLARPROCESS_PORT:-11055}"
 
 cd "$PROJECT_DIR"
-
-# ── Dynamic port allocation via PolarPort ────────────
-source "$PROJECT_DIR/../Agent_core/scripts/port-claim.sh"
-PORT=$(claim_port "$SERVICE_NAME" "$PROJECT" "$PREFERRED_PORT")
 
 HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
 
@@ -54,7 +50,7 @@ do_start() {
     LOG_FILE="$SCRIPT_DIR/polarprocess.log"
     NODE_BIN="$(which node)"
     TSX_BIN="$PROJECT_DIR/node_modules/.bin/tsx"
-    echo "[start.sh] Using node: $NODE_BIN ($($NODE_BIN --version))" >> "$LOG_FILE"
+    echo "[start.sh] Using node: $NODE_BIN ($($NODE_BIN --version)) pinned port=$PORT" >> "$LOG_FILE"
 
     if [ "${LAUNCHD:-}" = "1" ]; then
         exec env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1

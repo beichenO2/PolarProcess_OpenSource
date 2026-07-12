@@ -22,7 +22,8 @@ const DATA_DIR = process.env.POLARPROCESS_DATA_DIR
 const DB_PATH = process.env.POLARPROCESS_DB ?? path.join(DATA_DIR, 'process.sqlite');
 const SHARED_DB_PATH = process.env.POLARPROCESS_SHARED_DB
   ?? path.join(process.env.HOME ?? '', 'Polarisor', 'SOTAgent', 'data', 'resources.sqlite');
-const DEFAULT_PORT = Number(process.env.POLARPROCESS_PORT ?? 11055);
+/** Infrastructure pin — never accept PolarPort sticky/alternate ports. */
+const FIXED_PORT = Number(process.env.POLARPROCESS_PORT ?? 11055);
 const POLARPORT_URL = process.env.POLARPORT_URL ?? 'http://127.0.0.1:11050';
 
 const PM_CONFIG: IProcessManagerConfig = {
@@ -37,8 +38,10 @@ const PM_CONFIG: IProcessManagerConfig = {
   silent_restart_window_sec: 7200,
 };
 
-export function createApp(db: ProcessDB, serviceDb: ServiceDB): Hono {
-  const app = new Hono();
+export type PolarProcessApp = Hono & { startLifecycle: () => void };
+
+export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp {
+  const app = new Hono() as PolarProcessApp;
   const deviceId = process.env['SOTAGENT_DEVICE_ID'] || os.hostname().split('.')[0] || os.hostname();
   const profiler = new ResourceProfiler(db);
   const scheduler = new ResourceScheduler(db, deviceId, profiler);
@@ -183,40 +186,84 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): Hono {
     return c.json({ ok: true, message: `service ${body.name} registered`, id: body.id });
   });
 
-  // Start PM lifecycle loops
-  pm.startHealthCheckLoop();
-  pm.autoStartAll().then(started => {
-    if (started.length > 0) {
-      console.log(`[PolarProcess] 自启动了 ${started.length} 个服务: ${started.join(', ')}`);
-    }
-  });
-  pm.startCronLoop();
-  pm.startSilentWindowLoop();
-  pm.startSandboxMonitor();
+  // Lifecycle starts AFTER listen (see main) so autoStartAll cannot starve accept.
+  app.startLifecycle = () => {
+    pm.startHealthCheckLoop();
+    pm.startCronLoop();
+    pm.startSilentWindowLoop();
+    pm.startSandboxMonitor();
+    void pm.autoStartAll().then(started => {
+      if (started.length > 0) {
+        console.log(`[PolarProcess] 自启动了 ${started.length} 个服务: ${started.join(', ')}`);
+      }
+    }).catch(err => {
+      console.error('[PolarProcess] autoStartAll failed:', err);
+    });
+  };
 
   return app;
 }
 
-async function claimPort(): Promise<number> {
+/** Best-effort registry hygiene. Never bind whatever PolarPort returns. */
+async function announceFixedPort(port: number): Promise<void> {
   try {
+    // Drop sticky alternate ports left from prior claim_port reuse (8000/8030).
+    const listed = await fetch(`${POLARPORT_URL}/api/list`, { signal: AbortSignal.timeout(3000) });
+    if (listed.ok) {
+      const body = (await listed.json()) as
+        | Array<{ port?: number; service_name?: string }>
+        | { ports?: Array<{ port?: number; service_name?: string }> };
+      const rows = Array.isArray(body) ? body : (body.ports ?? []);
+      for (const row of rows) {
+        if (row.service_name === 'polar-process' && typeof row.port === 'number' && row.port !== port) {
+          await fetch(`${POLARPORT_URL}/api/release`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ port: row.port }),
+            signal: AbortSignal.timeout(3000),
+          }).catch(() => undefined);
+          console.warn(`[PolarProcess] released stale PolarPort claim on ${row.port}`);
+        }
+      }
+    }
+
     const r = await fetch(`${POLARPORT_URL}/api/allocate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         service_name: 'polar-process',
         project: 'PolarProcess',
-        preferred_port: DEFAULT_PORT,
+        preferred_port: port,
       }),
       signal: AbortSignal.timeout(3000),
     });
-    if (r.ok) {
-      const data = (await r.json()) as { ok?: boolean; port?: number };
-      if (data.ok && typeof data.port === 'number') return data.port;
+    if (!r.ok) return;
+    const data = (await r.json()) as { ok?: boolean; port?: number };
+    if (data.port != null && data.port !== port) {
+      console.warn(
+        `[PolarProcess] PolarPort returned ${data.port} for polar-process; releasing sticky claim — pinned to ${port}`,
+      );
+      await fetch(`${POLARPORT_URL}/api/release`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: data.port }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => undefined);
+      // Second pass: prefer FIXED_PORT after sticky row is released
+      await fetch(`${POLARPORT_URL}/api/allocate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          service_name: 'polar-process',
+          project: 'PolarProcess',
+          preferred_port: port,
+        }),
+        signal: AbortSignal.timeout(3000),
+      }).catch(() => undefined);
     }
   } catch {
-    /* PolarPort unreachable — fall back to DEFAULT_PORT */
+    /* PolarPort unreachable — fine; we already listen on FIXED_PORT */
   }
-  return DEFAULT_PORT;
 }
 
 async function registerCapabilities(port: number): Promise<void> {
@@ -249,13 +296,25 @@ async function main(): Promise<void> {
   const serviceDb = new ServiceDB(SHARED_DB_PATH);
   console.log(`[PolarProcess] ServiceDB opened: ${SHARED_DB_PATH}`);
 
-  const app = createApp(db, serviceDb);
-  const port = await claimPort();
+  if (!Number.isFinite(FIXED_PORT) || FIXED_PORT <= 0) {
+    console.error(`[PolarProcess] FATAL: invalid POLARPROCESS_PORT=${process.env.POLARPROCESS_PORT}`);
+    process.exit(1);
+  }
 
-  serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, (info) => {
-    console.log(`PolarProcess listening on http://127.0.0.1:${info.port}`);
+  const app = createApp(db, serviceDb);
+  const port = FIXED_PORT;
+
+  const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, (info) => {
+    console.log(`PolarProcess listening on http://127.0.0.1:${info.port} (pinned, skip PolarPort claim)`);
+    app.startLifecycle();
   });
 
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    console.error(`[PolarProcess] FATAL listen error on ${port}:`, err.message);
+    process.exit(1);
+  });
+
+  void announceFixedPort(port);
   await registerCapabilities(port);
 }
 

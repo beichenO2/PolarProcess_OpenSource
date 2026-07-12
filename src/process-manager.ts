@@ -77,6 +77,10 @@ export class ProcessManager {
   /** 内存中跟踪的子进程引用 */
   private childProcesses = new Map<string, ChildProcess>();
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  /** Skip overlapping health-check ticks (interval can fire while startService awaits 60s scripts). */
+  private healthCheckRunning = false;
+  /** Per-service start reentrancy guard — prevents AutoOffice-style spawn storms. */
+  private startInFlight = new Set<string>();
   /** 防止 excessive_restarts 日志每次健康检查都重复 */
   private excessiveRestartLogged = new Set<string>();
   /** 启动后 grace period，在此期间跳过端口绑定检查 */
@@ -359,6 +363,7 @@ export class ProcessManager {
   async autoStartAll(): Promise<string[]> {
     const services = this.db.listAutoStartServices(this.localDeviceId);
     const started: string[] = [];
+    const START_TIMEOUT_MS = 45_000;
 
     for (const svc of services) {
       if (!this.shouldRunLocally(svc)) continue;
@@ -375,8 +380,21 @@ export class ProcessManager {
         }
       }
 
-      const result = await this.startService(svc.id);
-      if (result.ok) started.push(svc.name);
+      try {
+        const result = await Promise.race([
+          this.startService(svc.id),
+          new Promise<IServiceActionResult>(resolve =>
+            setTimeout(
+              () => resolve({ ok: false, message: `autoStart timeout after ${START_TIMEOUT_MS}ms` }),
+              START_TIMEOUT_MS,
+            ),
+          ),
+        ]);
+        if (result.ok) started.push(svc.name);
+        else console.warn(`[PolarProcess] autoStart skip/fail ${svc.name}: ${result.message}`);
+      } catch (err) {
+        console.error(`[PolarProcess] autoStart error ${svc.name}:`, err);
+      }
 
       // 延迟避免同时启动太多进程
       const delay = this.config.process_manager?.auto_start_delay_sec ?? 5;
@@ -389,6 +407,18 @@ export class ProcessManager {
   // ─── 启动 / 停止 / 重启 ─────────────────────────────────
 
   async startService(serviceId: string): Promise<IServiceActionResult> {
+    if (this.startInFlight.has(serviceId)) {
+      return { ok: false, message: `服务 ${serviceId} 已在启动中` };
+    }
+    this.startInFlight.add(serviceId);
+    try {
+      return await this.startServiceInner(serviceId);
+    } finally {
+      this.startInFlight.delete(serviceId);
+    }
+  }
+
+  private async startServiceInner(serviceId: string): Promise<IServiceActionResult> {
     const svc = this.db.getService(serviceId);
     if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在` };
 
@@ -452,6 +482,8 @@ export class ProcessManager {
       if (!result.ok) {
         const msg = `Start script failed (exit=${result.exitCode}): ${result.stderr.slice(-300)}`;
         console.error(`[ProcessManager] ${svc.name}: ${msg}`);
+        const nextCount = (svc.restart_count ?? 0) + 1;
+        this.db.updateServiceRestartCount(serviceId, nextCount);
         this.db.updateServiceStatus(serviceId, 'error', {
           last_error: msg.slice(0, 500),
           last_exit_code: result.exitCode,
@@ -460,6 +492,7 @@ export class ProcessManager {
           service_id: serviceId, service_name: svc.name,
           event_type: 'script_start',
           detail: `FAILED: ${msg}`.slice(0, 500),
+          restart_count: nextCount,
         });
         return { ok: false, message: msg };
       }
@@ -900,6 +933,19 @@ export class ProcessManager {
   }
 
   private async runHealthChecks(): Promise<void> {
+    if (this.healthCheckRunning) {
+      console.warn('[Watchdog] previous health-check still running — skip overlapping tick');
+      return;
+    }
+    this.healthCheckRunning = true;
+    try {
+      await this.runHealthChecksInner();
+    } finally {
+      this.healthCheckRunning = false;
+    }
+  }
+
+  private async runHealthChecksInner(): Promise<void> {
     this.healthCheckCount++;
     if (this.healthCheckCount % ProcessManager.ORPHAN_SCAN_INTERVAL === 0) {
       await this.scanOrphanProcesses();

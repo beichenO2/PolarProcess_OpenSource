@@ -6,7 +6,6 @@
  */
 
 import Database from 'better-sqlite3';
-import { execSync as execSyncFn } from 'node:child_process';
 
 export interface ISharedServiceRow {
   id: string;
@@ -44,16 +43,6 @@ export interface IDeviceConfigRow {
   is_local: number;
   capabilities: string | null;
   last_seen: string;
-}
-
-interface IPortRegistryRow {
-  port: number;
-  service_name: string;
-  project: string;
-  device_id: string;
-  allocated_at: string;
-  last_verified: string;
-  status: 'active' | 'released' | 'stale';
 }
 
 export class ServiceDB {
@@ -297,7 +286,12 @@ export class ServiceDB {
     return lastDigit === 0 || lastDigit === 5;
   }
 
-  allocatePort(params: {
+  /**
+   * @deprecated Port allocation is PolarPort's sole authority (2026-07-09).
+   * Callers must use PolarPort HTTP `/api/allocate` (see ProcessManager.claimPortFromPolarPort).
+   * This local port_registry path is retained only so old call sites fail loudly.
+   */
+  allocatePort(_params: {
     service_name: string;
     project: string;
     device_id: string;
@@ -305,117 +299,10 @@ export class ServiceDB {
     range_start?: number;
     range_end?: number;
   }): number | null {
-    const rangeStart = params.range_start ?? 3000;
-    const rangeEnd = params.range_end ?? 9999;
-
-    // Phase 0: reuse active port for same service_name if not in use
-    const sameServiceRow = this.db.prepare(
-      "SELECT port FROM port_registry WHERE service_name = ? AND status = 'active' ORDER BY last_verified DESC LIMIT 1"
-    ).get(params.service_name) as { port: number } | undefined;
-
-    if (
-      sameServiceRow &&
-      sameServiceRow.port > 0 &&
-      ServiceDB.isPortCompliant(sameServiceRow.port) &&
-      !this.isPortInUse(sameServiceRow.port)
-    ) {
-      this.db.prepare(`
-        UPDATE port_registry SET
-          project = ?, device_id = ?, status = 'active',
-          allocated_at = datetime('now'), last_verified = datetime('now')
-        WHERE port = ?
-      `).run(params.project, params.device_id, sameServiceRow.port);
-      this.db.prepare(
-        "UPDATE port_registry SET status = 'released' WHERE service_name = ? AND status = 'active' AND port != ?"
-      ).run(params.service_name, sameServiceRow.port);
-      return sameServiceRow.port;
-    }
-
-    // Phase 1: preferred port
-    if (params.preferred_port != null) {
-      if (!ServiceDB.isPortCompliant(params.preferred_port)) {
-        console.warn(`[port] 拒绝分配端口 ${params.preferred_port}：不以 0 或 5 结尾`);
-        return null;
-      }
-
-      const existing = this.db.prepare(
-        "SELECT port, service_name FROM port_registry WHERE port = ? AND status = 'active'"
-      ).get(params.preferred_port) as { port: number; service_name: string } | undefined;
-
-      if (!existing && !this.isPortInUse(params.preferred_port)) {
-        this.db.prepare(`
-          INSERT INTO port_registry (port, service_name, project, device_id)
-          VALUES (?, ?, ?, ?)
-          ON CONFLICT(port) DO UPDATE SET
-            service_name = excluded.service_name,
-            project = excluded.project,
-            device_id = excluded.device_id,
-            status = 'active',
-            allocated_at = datetime('now'),
-            last_verified = datetime('now')
-        `).run(params.preferred_port, params.service_name, params.project, params.device_id);
-        return params.preferred_port;
-      }
-
-      if (existing && existing.service_name === params.service_name && !this.isPortInUse(params.preferred_port)) {
-        this.db.prepare(`
-          UPDATE port_registry SET
-            project = ?, device_id = ?, status = 'active',
-            allocated_at = datetime('now'), last_verified = datetime('now')
-          WHERE port = ?
-        `).run(params.project, params.device_id, params.preferred_port);
-        return params.preferred_port;
-      }
-
-      if (!existing) {
-        const staleRow = this.db.prepare(
-          "SELECT * FROM port_registry WHERE port = ? AND status IN ('released', 'stale')"
-        ).get(params.preferred_port) as IPortRegistryRow | undefined;
-
-        if (
-          staleRow &&
-          staleRow.service_name === params.service_name &&
-          staleRow.project === params.project &&
-          this.isPortInUse(params.preferred_port)
-        ) {
-          this.db.prepare(`
-            UPDATE port_registry SET
-              status = 'active', device_id = ?,
-              allocated_at = datetime('now'), last_verified = datetime('now')
-            WHERE port = ?
-          `).run(params.device_id, params.preferred_port);
-          console.log(`[port] allocatePort: 复活 released/stale 端口 ${params.preferred_port} (${params.service_name}/${params.project})`);
-          return params.preferred_port;
-        }
-      }
-    }
-
-    // Phase 2: search available ports
-    const allocatedPorts = new Set(
-      (this.db.prepare(
-        "SELECT port FROM port_registry WHERE status = 'active'"
-      ).all() as { port: number }[]).map(r => r.port)
+    throw new Error(
+      'ServiceDB.allocatePort removed — use PolarPort /api/allocate (sole port authority). ' +
+      'See Agent_core P27 / PolarProcess ProcessManager.claimPortFromPolarPort.',
     );
-
-    const firstCompliant = rangeStart % 5 === 0 ? rangeStart : rangeStart + (5 - rangeStart % 5);
-    for (let port = firstCompliant; port <= rangeEnd; port += 5) {
-      if (!allocatedPorts.has(port) && !this.isPortInUse(port)) {
-        this.db.prepare(`
-          INSERT INTO port_registry (port, service_name, project, device_id)
-          VALUES (?, ?, ?, ?)
-          ON CONFLICT(port) DO UPDATE SET
-            service_name = excluded.service_name,
-            project = excluded.project,
-            device_id = excluded.device_id,
-            status = 'active',
-            allocated_at = datetime('now'),
-            last_verified = datetime('now')
-        `).run(port, params.service_name, params.project, params.device_id);
-        return port;
-      }
-    }
-
-    return null;
   }
 
   releasePort(port: number): void {
@@ -428,14 +315,5 @@ export class ServiceDB {
     return this.db.prepare(
       "SELECT port, service_name FROM port_registry WHERE status = 'active'"
     ).all() as Array<{ port: number; service_name: string }>;
-  }
-
-  private isPortInUse(port: number): boolean {
-    try {
-      const result = execSyncFn(`lsof -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null`, { encoding: 'utf-8' });
-      return result.trim().length > 0;
-    } catch {
-      return false;
-    }
   }
 }
