@@ -735,6 +735,26 @@ export class ProcessManager {
   }
 
   /**
+   * 判断 candidate 是否为 ancestor 的后代进程（沿 ppid 链向上走，最多 6 层）。
+   * npm run → npm → tsx wrapper → node 实际监听者可以有 2-3 层间隔。
+   */
+  private async isDescendantOf(candidatePid: number, ancestorPid: number): Promise<boolean> {
+    let current = candidatePid;
+    for (let depth = 0; depth < 6; depth++) {
+      try {
+        const { stdout } = await execAsync(`ps -p ${current} -o ppid= 2>/dev/null`, { timeout: 3000 });
+        const ppid = parseInt(stdout.trim(), 10);
+        if (!Number.isFinite(ppid) || ppid <= 1) return false;
+        if (ppid === ancestorPid) return true;
+        current = ppid;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  /**
    * 启动后验证：检查注册端口是否被正确的 PID 占用。
    * 防止服务静默切换到其他端口（如 Vite 无 --strictPort）。
    * 增加重试机制：最多重试 12 次，每次等待 5 秒（共 60 秒）。
@@ -751,21 +771,18 @@ export class ProcessManager {
           return; // exact match
         }
 
-        // Check if occupant is a child/descendant of our shell wrapper
-        try {
-          const { stdout: ppidStr } = await execAsync(`ps -p ${occupant.pid} -o ppid= 2>/dev/null`, { timeout: 3000 });
-          const ppid = parseInt(ppidStr.trim(), 10);
-          if (ppid === pid) {
-            console.log(`[PortVerify] ${serviceName}: PID 校正 ${pid} → ${occupant.pid} (子进程替代 shell wrapper)`);
-            this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
-            this.db.logServiceEvent({
-              service_id: serviceId, service_name: serviceName,
-              event_type: 'pid_updated',
-              detail: `PID corrected: shell wrapper ${pid} → child process ${occupant.pid}`,
-            });
-            return;
-          }
-        } catch { /* ignore */ }
+        // Check if occupant is a child/descendant of our shell wrapper.
+        // Walk the ancestor chain (npm → tsx → node can be 2-3 levels deep).
+        if (await this.isDescendantOf(occupant.pid, pid)) {
+          console.log(`[PortVerify] ${serviceName}: PID 校正 ${pid} → ${occupant.pid} (后代进程替代 shell wrapper)`);
+          this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
+          this.db.logServiceEvent({
+            service_id: serviceId, service_name: serviceName,
+            event_type: 'pid_updated',
+            detail: `PID corrected: wrapper ${pid} → descendant listener ${occupant.pid}`,
+          });
+          return;
+        }
 
         // Shell wrapper likely exited (ppid=1); check if occupant belongs to this service
         const ownSvc = this.isOwnService(occupant);
@@ -1358,10 +1375,13 @@ export class ProcessManager {
    * 检查端口是否被占用，返回占用进程的信息。
    * 如果端口空闲返回 null。
    */
+  // launchd's PATH may omit /usr/sbin, so always use the absolute lsof path.
+  private static readonly LSOF = '/usr/sbin/lsof';
+
   private getPortOccupant(port: number): { pid: number; command: string } | null {
     try {
       const out = execSync(
-        `lsof -iTCP:${port} -sTCP:LISTEN -P -n -t 2>/dev/null || true`,
+        `${ProcessManager.LSOF} -iTCP:${port} -sTCP:LISTEN -P -n -t 2>/dev/null || true`,
         { encoding: 'utf-8', timeout: 5000 },
       ).trim();
       if (!out) return null;
@@ -1379,7 +1399,7 @@ export class ProcessManager {
   private async getPortOccupantAsync(port: number): Promise<{ pid: number; command: string } | null> {
     try {
       const { stdout } = await execAsync(
-        `lsof -iTCP:${port} -sTCP:LISTEN -P -n -t 2>/dev/null || true`,
+        `${ProcessManager.LSOF} -iTCP:${port} -sTCP:LISTEN -P -n -t 2>/dev/null || true`,
         { timeout: 5000 },
       );
       const out = stdout.trim();
@@ -1871,7 +1891,7 @@ export class ProcessManager {
     let listenLines: string;
     try {
       const { stdout } = await execAsync(
-        'lsof -iTCP -sTCP:LISTEN -P -n -F pn 2>/dev/null',
+        `${ProcessManager.LSOF} -iTCP -sTCP:LISTEN -P -n -F pn 2>/dev/null`,
         { timeout: 5000 },
       );
       listenLines = stdout;
