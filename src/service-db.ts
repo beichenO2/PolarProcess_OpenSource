@@ -45,6 +45,23 @@ export interface IDeviceConfigRow {
   last_seen: string;
 }
 
+export interface IServiceRegistrationParams {
+  id: string;
+  name: string;
+  command: string;
+  work_dir?: string | null;
+  mem_requirement_mb?: number;
+  gpu_mem_requirement_mb?: number;
+  device_id?: string;
+  auto_start?: boolean;
+  restart_on_failure?: boolean;
+  max_restarts?: number;
+  port?: number | null;
+  health_check_url?: string | null;
+  cron_schedule?: string | null;
+  start_script_dir?: string | null;
+}
+
 export class ServiceDB {
   private readonly db: Database.Database;
 
@@ -61,22 +78,7 @@ export class ServiceDB {
     return this.db.prepare('SELECT * FROM shared_services WHERE id = ?').get(id) as ISharedServiceRow | undefined;
   }
 
-  registerService(params: {
-    id: string;
-    name: string;
-    command: string;
-    work_dir?: string | null;
-    mem_requirement_mb?: number;
-    gpu_mem_requirement_mb?: number;
-    device_id?: string;
-    auto_start?: boolean;
-    restart_on_failure?: boolean;
-    max_restarts?: number;
-    port?: number | null;
-    health_check_url?: string | null;
-    cron_schedule?: string | null;
-    start_script_dir?: string | null;
-  }): void {
+  registerService(params: IServiceRegistrationParams): void {
     this.db.prepare(`
       INSERT INTO shared_services (id, name, command, work_dir, mem_requirement_mb, gpu_mem_requirement_mb, device_id, auto_start, restart_on_failure, max_restarts, port, health_check_url, cron_schedule, start_script_dir)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

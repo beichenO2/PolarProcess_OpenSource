@@ -149,6 +149,16 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     return c.json(result, result.ok ? 200 : 500);
   });
 
+  app.post('/api/services/:id/reconcile-children', async (c) => {
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => ({})) as { stale_pids?: unknown };
+    if (!Array.isArray(body.stale_pids)) {
+      return c.json({ ok: false, message: 'stale_pids array is required' }, 400);
+    }
+    const result = await pm.reconcileServiceChildren(id, body.stale_pids as number[]);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
   app.post('/api/services/:id/reset-restart-count', (c) => {
     const id = c.req.param('id');
     const svc = serviceDb.getService(id);
@@ -162,8 +172,8 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     if (!body.id || !body.name || !body.command) {
       return c.json({ ok: false, message: 'id, name and command are required' }, 400);
     }
-    serviceDb.registerService(body);
-    return c.json({ ok: true, message: `service ${body.name} registered`, id: body.id });
+    const result = pm.registerService(body);
+    return c.json(result, result.ok ? 200 : 409);
   });
 
   app.post('/api/services/register-and-start', async (c) => {
@@ -171,7 +181,8 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     if (!body.id || !body.name || !body.command) {
       return c.json({ ok: false, message: 'id, name and command are required' }, 400);
     }
-    serviceDb.registerService(body);
+    const registration = pm.registerService(body);
+    if (!registration.ok) return c.json(registration, 409);
     const result = await pm.startService(body.id);
     return c.json({ ...result, id: body.id }, result.ok ? 200 : 500);
   });
@@ -182,8 +193,8 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     if (!body.id || !body.name || !body.command) {
       return c.json({ ok: false, message: 'id, name and command are required' }, 400);
     }
-    serviceDb.registerService(body);
-    return c.json({ ok: true, message: `service ${body.name} registered`, id: body.id });
+    const result = pm.registerService(body);
+    return c.json(result, result.ok ? 200 : 409);
   });
 
   // Lifecycle starts AFTER listen (see main) so autoStartAll cannot starve accept.

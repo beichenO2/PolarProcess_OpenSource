@@ -63,6 +63,21 @@
           ]
         },
         {
+          "name": "运行中注册保护与受管子进程泄漏收敛",
+          "status": "done",
+          "interfaces": [
+            "POST /api/services/register → 409 when runtime identity changes while active",
+            "POST /api/services/:id/reconcile-children → explicit stale PID reconciliation"
+          ],
+          "test_status": "passed",
+          "evidence": [
+            "2026-07-17: npm test — 38/38 passed; npm run build passed",
+            "2026-07-17: local TaoCi stale pid 64048 reaped; pid 64857 retained and healthy",
+            "2026-07-17: remote runtime-ownership-v2 release recovered exactly one TaoCi supervisor pid 89450 after the 15s retry window",
+            "2026-07-17: active runtime identity change probes returned 409 locally and remotely without mutating work_dir"
+          ]
+        },
+        {
           "name": "GET /api/processes",
           "status": "done",
           "interfaces": [

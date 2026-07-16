@@ -9,14 +9,15 @@
  * - 将非本机服务的请求转发到远程设备
  */
 
-import { spawn, execSync, exec, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, exec, execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import type { ServiceDB, ISharedServiceRow } from './service-db.js';
+import type { ServiceDB, ISharedServiceRow, IServiceRegistrationParams } from './service-db.js';
 import { getPeerTailscaleIP } from './tailscale-client.js';
 const SOTAGENT_API_PORT = Number(process.env.SOTAGENT_API_PORT ?? 4800);
 import { validateCommand, normalizeCommand } from './command-guard.js';
@@ -66,6 +67,66 @@ export interface IServiceActionResult {
   ok: boolean;
   message: string;
   pid?: number;
+}
+
+export interface IServiceRegistrationResult {
+  ok: boolean;
+  message: string;
+  id: string;
+  code?: 'SERVICE_RUNNING';
+  changed_fields?: string[];
+}
+
+export interface IServiceReconcileResult {
+  ok: boolean;
+  message: string;
+  service_id: string;
+  kept_pid?: number;
+  reaped_pids: number[];
+}
+
+interface IManagedProcessIdentity {
+  pid: number;
+  ppid: number;
+  command: string;
+  cwd: string;
+}
+
+export function getRuntimeRegistrationChanges(
+  existing: ISharedServiceRow,
+  params: IServiceRegistrationParams,
+): string[] {
+  const changes: string[] = [];
+  const nextValues = {
+    command: params.command,
+    work_dir: params.work_dir ?? null,
+    device_id: params.device_id ?? 'any',
+    start_script_dir: params.start_script_dir ?? null,
+    port: params.port ?? existing.port,
+  };
+  for (const [field, value] of Object.entries(nextValues)) {
+    if (existing[field as keyof ISharedServiceRow] !== value) changes.push(field);
+  }
+  return changes;
+}
+
+export function registeredCommandMatchesRuntime(registered: string, runtime: string): boolean {
+  const normalize = (value: string) => value.trim().replace(/\s+/g, ' ');
+  const expected = normalize(registered).replace(/^exec\s+/, '');
+  const actual = normalize(runtime);
+  return expected === actual || (actual.includes('/') && expected.endsWith(` ${actual}`));
+}
+
+export function isManagedPortOccupant(input: {
+  serviceId: string;
+  managedPid: number | null;
+  occupantPid: number;
+  occupantIsDescendant: boolean;
+  matchedServiceId: string | null;
+}): boolean {
+  return input.managedPid === input.occupantPid ||
+    input.occupantIsDescendant ||
+    input.matchedServiceId === input.serviceId;
 }
 
 // ─── 进程管理器 ────────────────────────────────────────────
@@ -372,7 +433,7 @@ export class ProcessManager {
       // Check if service is already running on its port (PID may be stale after restart)
       if (svc.port) {
         const occupant = await this.getPortOccupantAsync(svc.port);
-        if (occupant) {
+        if (occupant && await this.canAdoptPortOccupant(svc.id, occupant, svc.pid)) {
           this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
           this.db.updateServiceRestartCount(svc.id, 0);
           started.push(svc.name);
@@ -406,6 +467,27 @@ export class ProcessManager {
 
   // ─── 启动 / 停止 / 重启 ─────────────────────────────────
 
+  registerService(params: IServiceRegistrationParams): IServiceRegistrationResult {
+    const existing = this.db.getService(params.id);
+    if (existing) {
+      const changedFields = getRuntimeRegistrationChanges(existing, params);
+      const ownsLiveChild = this.childProcesses.has(params.id);
+      const lifecycleActive = existing.status === 'running' || existing.status === 'starting';
+      if (changedFields.length > 0 && (lifecycleActive || ownsLiveChild)) {
+        return {
+          ok: false,
+          code: 'SERVICE_RUNNING',
+          id: params.id,
+          changed_fields: changedFields,
+          message: `服务 ${params.id} 正在运行；请先停止服务再修改运行配置: ${changedFields.join(', ')}`,
+        };
+      }
+    }
+
+    this.db.registerService(params);
+    return { ok: true, id: params.id, message: `service ${params.name} registered` };
+  }
+
   async startService(serviceId: string): Promise<IServiceActionResult> {
     if (this.startInFlight.has(serviceId)) {
       return { ok: false, message: `服务 ${serviceId} 已在启动中` };
@@ -426,6 +508,16 @@ export class ProcessManager {
       return this.forwardToRemote(svc.device_id, serviceId, 'start');
     }
 
+    // A queued watchdog retry can observe a stale DB status after autoStart already spawned
+    // the service. The live ChildProcess reference is the stronger ownership signal.
+    const trackedChild = this.childProcesses.get(serviceId);
+    if (trackedChild?.pid && this.isProcessAlive(trackedChild.pid)) {
+      if (svc.status !== 'running' || svc.pid !== trackedChild.pid) {
+        this.db.updateServiceStatus(serviceId, 'running', { pid: trackedChild.pid });
+      }
+      return { ok: true, message: '服务已由 PolarProcess 子进程运行', pid: trackedChild.pid };
+    }
+
     // 如果已在运行，直接返回
     if (svc.status === 'running' && svc.pid && this.isProcessAlive(svc.pid)) {
       return { ok: true, message: '服务已在运行', pid: svc.pid };
@@ -435,19 +527,12 @@ export class ProcessManager {
     // 若是则直接 adopt，避免触发 EADDRINUSE 再被记为 error。
     if (svc.port) {
       const occupant = await this.getPortOccupantAsync(svc.port);
-      if (occupant) {
-        const workDir = svc.work_dir ? svc.work_dir.replace(/^~/, os.homedir()) : '';
-        const cmdSnippet = (svc.command ?? '').replace(/^.*\s/, '').slice(0, 40);
-        const isOurOrphan =
-          (workDir && occupant.command.includes(workDir)) ||
-          (cmdSnippet && occupant.command.includes(cmdSnippet));
-        if (isOurOrphan) {
-          console.log(`[ProcessManager] 采纳孤儿进程 ${svc.name} pid=${occupant.pid} (端口 ${svc.port} 已监听)`);
-          this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
-          this.db.updateServiceRestartCount(svc.id, 0);
-          this.excessiveRestartLogged.delete(svc.id);
-          return { ok: true, message: `已采纳运行中的进程 pid=${occupant.pid}`, pid: occupant.pid };
-        }
+      if (occupant && await this.canAdoptPortOccupant(svc.id, occupant, svc.pid)) {
+        console.log(`[ProcessManager] 采纳孤儿进程 ${svc.name} pid=${occupant.pid} (端口 ${svc.port} 已监听)`);
+        this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
+        this.db.updateServiceRestartCount(svc.id, 0);
+        this.excessiveRestartLogged.delete(svc.id);
+        return { ok: true, message: `已采纳运行中的进程 pid=${occupant.pid}`, pid: occupant.pid };
       }
     }
 
@@ -599,7 +684,7 @@ export class ProcessManager {
 
       child.on('error', (err) => {
         console.error(`[ProcessManager] 服务 ${svc.name} spawn 失败: ${err.message}`);
-        this.childProcesses.delete(serviceId);
+        if (this.childProcesses.get(serviceId) === child) this.childProcesses.delete(serviceId);
         this.db.updateServiceStatus(serviceId, 'error');
         this.db.logServiceEvent({
           service_id: serviceId, service_name: svc.name,
@@ -617,7 +702,7 @@ export class ProcessManager {
       this.childProcesses.set(serviceId, child);
 
       child.on('exit', async (code, signal) => {
-        this.childProcesses.delete(serviceId);
+        if (this.childProcesses.get(serviceId) === child) this.childProcesses.delete(serviceId);
         const stderr = this.stderrBuffers.get(serviceId) ?? '';
         this.stderrBuffers.delete(serviceId);
         const launchPort = freshSvc.port;
@@ -632,7 +717,7 @@ export class ProcessManager {
 
             if (launchPort) {
               const occupant = await this.getPortOccupantAsync(launchPort);
-              if (occupant) {
+              if (occupant && await this.canAdoptPortOccupant(serviceId, occupant, child.pid ?? null)) {
                 this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
                 return;
               }
@@ -754,6 +839,23 @@ export class ProcessManager {
     return false;
   }
 
+  private async canAdoptPortOccupant(
+    serviceId: string,
+    occupant: { pid: number; command: string },
+    managedPid: number | null,
+  ): Promise<boolean> {
+    const occupantIsDescendant = managedPid != null &&
+      await this.isDescendantOf(occupant.pid, managedPid);
+    const matchedServiceId = this.isOwnService(occupant)?.serviceId ?? null;
+    return isManagedPortOccupant({
+      serviceId,
+      managedPid,
+      occupantPid: occupant.pid,
+      occupantIsDescendant,
+      matchedServiceId,
+    });
+  }
+
   /**
    * 启动后验证：检查注册端口是否被正确的 PID 占用。
    * 防止服务静默切换到其他端口（如 Vite 无 --strictPort）。
@@ -771,28 +873,13 @@ export class ProcessManager {
           return; // exact match
         }
 
-        // Check if occupant is a child/descendant of our shell wrapper.
-        // Walk the ancestor chain (npm → tsx → node can be 2-3 levels deep).
-        if (await this.isDescendantOf(occupant.pid, pid)) {
+        if (await this.canAdoptPortOccupant(serviceId, occupant, pid)) {
           console.log(`[PortVerify] ${serviceName}: PID 校正 ${pid} → ${occupant.pid} (后代进程替代 shell wrapper)`);
           this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
           this.db.logServiceEvent({
             service_id: serviceId, service_name: serviceName,
             event_type: 'pid_updated',
             detail: `PID corrected: wrapper ${pid} → descendant listener ${occupant.pid}`,
-          });
-          return;
-        }
-
-        // Shell wrapper likely exited (ppid=1); check if occupant belongs to this service
-        const ownSvc = this.isOwnService(occupant);
-        if (ownSvc && ownSvc.serviceId === serviceId) {
-          console.log(`[PortVerify] ${serviceName}: PID 校正 ${pid} → ${occupant.pid} (服务进程替代 shell wrapper)`);
-          this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
-          this.db.logServiceEvent({
-            service_id: serviceId, service_name: serviceName,
-            event_type: 'pid_updated',
-            detail: `PID corrected: ${pid} → ${occupant.pid} (matched by service identity)`,
           });
           return;
         }
@@ -827,6 +914,132 @@ export class ProcessManager {
       event_type: 'health_fail',
       detail: `Port ${port} not bound after ${PORT_BIND_RETRIES * PORT_BIND_WAIT_MS / 1000}s. Process ${pid} may have used a different port.`,
     });
+  }
+
+  private async readManagedProcessIdentity(pid: number): Promise<IManagedProcessIdentity | null> {
+    if (!Number.isSafeInteger(pid) || pid <= 1 || !this.isProcessAlive(pid)) return null;
+    try {
+      const { stdout } = await execFileAsync(
+        'ps',
+        ['-p', String(pid), '-o', 'ppid=', '-o', 'command='],
+        { timeout: 3000, maxBuffer: 64 * 1024 },
+      );
+      const match = stdout.match(/^\s*(\d+)\s+(.+?)\s*$/s);
+      if (!match) return null;
+
+      let cwd = '';
+      if (process.platform === 'linux') {
+        cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      } else {
+        const result = await execFileAsync(
+          'lsof',
+          ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
+          { timeout: 3000, maxBuffer: 64 * 1024 },
+        );
+        cwd = result.stdout.split('\n').find(line => line.startsWith('n'))?.slice(1) ?? '';
+      }
+      if (!cwd) return null;
+      return { pid, ppid: Number(match[1]), command: match[2]!.trim(), cwd };
+    } catch {
+      return null;
+    }
+  }
+
+  private canonicalPath(value: string): string {
+    const resolved = value.replace(/^~/, os.homedir());
+    try { return fs.realpathSync(resolved); } catch { return path.resolve(resolved); }
+  }
+
+  async reconcileServiceChildren(
+    serviceId: string,
+    stalePids: number[],
+  ): Promise<IServiceReconcileResult> {
+    const emptyResult = { service_id: serviceId, reaped_pids: [] as number[] };
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在`, ...emptyResult };
+    if (!this.shouldRunLocally(svc)) {
+      return { ok: false, message: `服务 ${serviceId} 不属于本机`, ...emptyResult };
+    }
+    if (svc.status !== 'running' || !svc.pid || !this.isProcessAlive(svc.pid)) {
+      return { ok: false, message: `服务 ${serviceId} 没有可验证的当前运行 PID`, ...emptyResult };
+    }
+    if (!Array.isArray(stalePids) || stalePids.length === 0) {
+      return { ok: false, message: 'stale_pids must contain at least one PID', ...emptyResult };
+    }
+
+    const uniquePids = [...new Set(stalePids)];
+    if (uniquePids.some(pid => !Number.isSafeInteger(pid) || pid <= 1 || pid === svc.pid)) {
+      return { ok: false, message: 'stale_pids contains an invalid or current service PID', ...emptyResult };
+    }
+
+    const current = await this.readManagedProcessIdentity(svc.pid);
+    if (!current || !registeredCommandMatchesRuntime(svc.command, current.command)) {
+      return { ok: false, message: `当前 PID ${svc.pid} 与注册命令不匹配`, ...emptyResult };
+    }
+    const registeredCwd = this.canonicalPath(svc.work_dir ?? current.cwd);
+    if (this.canonicalPath(current.cwd) !== registeredCwd) {
+      return { ok: false, message: `当前 PID ${svc.pid} 的工作目录与注册记录不匹配`, ...emptyResult };
+    }
+
+    const registeredPids = new Set(
+      this.db.listServices().filter(row => row.pid != null).map(row => row.pid as number),
+    );
+    const candidates: IManagedProcessIdentity[] = [];
+    for (const pid of uniquePids) {
+      if (registeredPids.has(pid)) {
+        return { ok: false, message: `PID ${pid} 仍属于一个已注册服务`, ...emptyResult };
+      }
+      const candidate = await this.readManagedProcessIdentity(pid);
+      if (!candidate) return { ok: false, message: `无法读取候选 PID ${pid}`, ...emptyResult };
+
+      const sameCommand = candidate.command === current.command;
+      const candidateCwd = this.canonicalPath(candidate.cwd);
+      const sameRuntimeScope = candidateCwd === registeredCwd ||
+        path.dirname(candidateCwd) === path.dirname(registeredCwd);
+      const authorityOwned = candidate.ppid === process.pid || candidate.ppid === current.ppid;
+      if (!sameCommand || !sameRuntimeScope || !authorityOwned) {
+        return {
+          ok: false,
+          message: `PID ${pid} 未通过命令、工作目录和 PolarProcess 所有权校验`,
+          ...emptyResult,
+        };
+      }
+      candidates.push(candidate);
+    }
+
+    for (const candidate of candidates) {
+      // Duplicate supervisors share cleanup state with the current instance. SIGKILL avoids
+      // running an obsolete EXIT trap that would stop the live container stack.
+      process.kill(candidate.pid, 'SIGKILL');
+      for (let attempt = 0; attempt < 20 && this.isProcessAlive(candidate.pid); attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (this.isProcessAlive(candidate.pid)) {
+        return {
+          ok: false,
+          message: `PID ${candidate.pid} did not exit after reconciliation`,
+          kept_pid: svc.pid,
+          reaped_pids: candidates
+            .filter(item => !this.isProcessAlive(item.pid))
+            .map(item => item.pid),
+          service_id: serviceId,
+        };
+      }
+      this.db.logServiceEvent({
+        service_id: serviceId,
+        service_name: svc.name,
+        event_type: 'orphan_killed',
+        detail: `Reaped stale PolarProcess child pid=${candidate.pid}; kept pid=${svc.pid}`,
+      });
+    }
+
+    return {
+      ok: true,
+      message: `已收敛 ${candidates.length} 个重复子进程`,
+      service_id: serviceId,
+      kept_pid: svc.pid,
+      reaped_pids: candidates.map(candidate => candidate.pid),
+    };
   }
 
   async stopService(serviceId: string): Promise<IServiceActionResult> {
@@ -1017,7 +1230,7 @@ export class ProcessManager {
         // Also handles orphan processes from a previous SOTAgent instance.
         if (!alive && svc.port) {
           const occupant = await this.getPortOccupantAsync(svc.port);
-          if (occupant) {
+          if (occupant && await this.canAdoptPortOccupant(svc.id, occupant, svc.pid)) {
             this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
             this.db.updateServiceRestartCount(svc.id, 0);
             this.excessiveRestartLogged.delete(svc.id);
@@ -1120,7 +1333,7 @@ export class ProcessManager {
       // Shell wrapper may exit; check port for actual service process
       if (!aliveRunning && svc.port) {
         const occupant = await this.getPortOccupantAsync(svc.port);
-        if (occupant) {
+        if (occupant && await this.canAdoptPortOccupant(svc.id, occupant, svc.pid)) {
           this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
           aliveRunning = true;
         }
@@ -1185,7 +1398,7 @@ export class ProcessManager {
           continue;
         } else {
           this.portMissCount.delete(`port_miss_${svc.id}`);
-          if (occupant.pid !== svc.pid) {
+          if (occupant.pid !== svc.pid && await this.canAdoptPortOccupant(svc.id, occupant, svc.pid)) {
             console.log(`[Watchdog] ${svc.name}: PID 变更 ${svc.pid} → ${occupant.pid} (端口 ${svc.port} 监听者更新)`);
             this.db.updateServiceStatus(svc.id, 'running', { pid: occupant.pid });
             this.db.logServiceEvent({
@@ -1928,6 +2141,19 @@ export class ProcessManager {
         if (!svc) continue; // unregistered port — not our concern
 
         if (svc.status === 'running' && svc.pid === pid) continue; // legitimate service
+
+        let command = '';
+        try {
+          const { stdout } = await execAsync(`ps -p ${pid} -o command= 2>/dev/null || true`, { timeout: 3000 });
+          command = stdout.trim();
+        } catch { /* process may have exited */ }
+        const occupant = { pid, command };
+        const managed = await this.canAdoptPortOccupant(svc.id, occupant, svc.pid);
+        if (!managed) continue; // external proxy or third-party listener: never signal it
+        if (svc.status === 'running') {
+          this.db.updateServiceStatus(svc.id, 'running', { pid });
+          continue;
+        }
 
         // Orphan: listening on registered port but PID doesn't match
         activeOrphans.add(pid);
