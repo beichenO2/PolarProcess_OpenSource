@@ -129,6 +129,88 @@ export function isManagedPortOccupant(input: {
     input.matchedServiceId === input.serviceId;
 }
 
+interface IComposeContainerBinding {
+  state?: { running?: boolean };
+  labels?: Record<string, string>;
+  portBindings?: Record<string, Array<{
+    hostIp?: string;
+    hostPort?: string;
+  }> | null>;
+}
+
+export function composeRuntimeIdentityFromSsot(input: {
+  serviceId: string;
+  registeredCommand: string;
+  serviceWorkDir: string;
+  ssot: unknown;
+}): { project: string; configFiles: string[] } | null {
+  if (!input.ssot || typeof input.ssot !== 'object' || Array.isArray(input.ssot)) return null;
+  const management = (input.ssot as { service_management?: unknown }).service_management;
+  if (!management || typeof management !== 'object' || Array.isArray(management)) return null;
+  const contract = management as Record<string, unknown>;
+  const normalize = (value: unknown) => String(value ?? '')
+    .trim()
+    .replace(/^exec\s+/u, '')
+    .replace(/\s+/gu, ' ');
+  const project = String(contract.compose_project ?? '').trim();
+  const files = contract.compose_files;
+  if (
+    contract.service_id !== input.serviceId
+    || contract.process_mode !== 'foreground_command'
+    || normalize(contract.start_command) !== normalize(input.registeredCommand)
+    || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(project)
+    || !Array.isArray(files)
+    || files.length === 0
+  ) return null;
+  const workDir = path.resolve(input.serviceWorkDir.replace(/^~/, os.homedir()));
+  const configFiles: string[] = [];
+  for (const file of files) {
+    const relative = String(file ?? '').trim();
+    if (!relative || path.isAbsolute(relative) || relative.split(/[\\/]/u).includes('..')) return null;
+    const resolved = path.resolve(workDir, relative);
+    if (!resolved.startsWith(`${workDir}${path.sep}`)) return null;
+    configFiles.push(resolved);
+  }
+  if (new Set(configFiles).size !== configFiles.length) return null;
+  return { project, configFiles: configFiles.sort() };
+}
+
+export function isManagedComposePortBinding(input: {
+  occupantCommand: string;
+  serviceWorkDir: string;
+  port: number;
+  expectedProject: string;
+  expectedConfigFiles: string[];
+  containers: IComposeContainerBinding[];
+}): boolean {
+  if (!/(?:com\.docker\.backend|docker-proxy|vpnkit)/iu.test(input.occupantCommand)) return false;
+  const workDir = path.resolve(input.serviceWorkDir.replace(/^~/, os.homedir()));
+  const expectedConfigFiles = [...new Set(input.expectedConfigFiles.map((file) => path.resolve(file)))].sort();
+  if (!input.expectedProject || expectedConfigFiles.length === 0) return false;
+  const matching = input.containers.filter((container) => {
+    const labels = container.labels ?? {};
+    const composeWorkDir = labels['com.docker.compose.project.working_dir'];
+    const composeConfigFiles = String(labels['com.docker.compose.project.config_files'] ?? '')
+      .split(',')
+      .map((file) => file.trim())
+      .filter(Boolean)
+      .map((file) => path.resolve(file))
+      .sort();
+    if (
+      container.state?.running !== true
+      || !composeWorkDir
+      || path.resolve(composeWorkDir) !== workDir
+      || labels['com.docker.compose.project'] !== input.expectedProject
+      || composeConfigFiles.length !== expectedConfigFiles.length
+      || composeConfigFiles.some((file, index) => file !== expectedConfigFiles[index])
+    ) return false;
+    return Object.values(container.portBindings ?? {}).some((bindings) => (
+      Array.isArray(bindings) && bindings.some((binding) => Number(binding.hostPort) === input.port)
+    ));
+  });
+  return matching.length === 1;
+}
+
 // ─── 进程管理器 ────────────────────────────────────────────
 
 export class ProcessManager {
@@ -536,11 +618,6 @@ export class ProcessManager {
       }
     }
 
-    if (svc.restart_count > 0) {
-      this.db.updateServiceRestartCount(serviceId, 0);
-      this.excessiveRestartLogged.delete(serviceId);
-    }
-
     // ─── Script mode: delegate to Start/start.sh ────────
     const scriptDir = this.resolveScriptDir(svc);
     if (scriptDir) {
@@ -768,20 +845,18 @@ export class ProcessManager {
               // instead of spinning into another restart cycle.
               if (launchPort) {
                 const finalOccupant = await this.getPortOccupantAsync(launchPort);
-                if (finalOccupant) {
+                if (finalOccupant && await this.adoptTransientPortOccupant(
+                  serviceId,
+                  freshSvc.name,
+                  child.pid ?? null,
+                  finalOccupant,
+                  launchPort,
+                )) {
                   console.log(`[Watchdog] ${freshSvc.name}: 端口 ${launchPort} 已被 pid=${finalOccupant.pid} 监听，采纳为 running`);
-                  this.db.updateServiceStatus(serviceId, 'running', { pid: finalOccupant.pid });
-                  this.db.updateServiceRestartCount(serviceId, 0);
-                  this.excessiveRestartLogged.delete(serviceId);
-                  this.db.logServiceEvent({
-                    service_id: serviceId, service_name: freshSvc.name,
-                    event_type: 'adopted',
-                    detail: `Adopted pid=${finalOccupant.pid} on port ${launchPort} after transient EADDRINUSE exhaustion`,
-                  });
                   return;
                 }
               }
-              console.log(`[Watchdog] ${freshSvc.name}: 端口仍空闲，转入常规重启`);
+              console.log(`[Watchdog] ${freshSvc.name}: 未发现可验证的受管监听者，转入常规重启`);
             }
 
             if (exitStatus === 'error' && current.restart_on_failure && current.restart_count < current.max_restarts) {
@@ -881,6 +956,11 @@ export class ProcessManager {
             event_type: 'pid_updated',
             detail: `PID corrected: wrapper ${pid} → descendant listener ${occupant.pid}`,
           });
+          return;
+        }
+
+        const service = this.db.getService(serviceId);
+        if (service && await this.isRegisteredComposePortBinding(service, occupant)) {
           return;
         }
 
@@ -1049,6 +1129,11 @@ export class ProcessManager {
     if (!this.shouldRunLocally(svc)) {
       return this.forwardToRemote(svc.device_id, serviceId, 'stop');
     }
+
+    // Publish the explicit lifecycle decision before waiting on a child or a
+    // stop script. Concurrent health scans must not treat the dying PID as an
+    // unexpected crash and schedule a replacement.
+    this.db.updateServiceStatus(serviceId, 'stopped');
 
     // ─── Script mode: delegate to Start/stop.sh ─────────
     const scriptDir = this.resolveScriptDir(svc);
@@ -1349,16 +1434,21 @@ export class ProcessManager {
       }
 
       if (!aliveRunning) {
+        // The scan works from a snapshot. An explicit stop may have changed the
+        // live row while we were probing; never overwrite that newer lifecycle
+        // decision or schedule a stale restart.
+        const current = this.db.getService(svc.id);
+        if (current?.status !== 'running' || current.pid !== svc.pid) continue;
         console.log(`[ProcessManager] 服务 ${svc.name} (pid=${svc.pid}) 已不存在`);
         this.db.logServiceEvent({
           service_id: svc.id, service_name: svc.name,
           event_type: 'crashed',
           detail: `Process pid=${svc.pid} not found`,
-          restart_count: svc.restart_count,
+          restart_count: current.restart_count,
         });
-        if (svc.restart_on_failure && svc.restart_count < svc.max_restarts) {
+        if (current.restart_on_failure && current.restart_count < current.max_restarts) {
           this.db.updateServiceStatus(svc.id, 'starting', {
-            restart_count: svc.restart_count + 1,
+            restart_count: current.restart_count + 1,
           });
           const cooldown = (this.config.process_manager?.restart_cooldown_sec ?? 10) * 1000;
           setTimeout(() => this.startService(svc.id), cooldown);
@@ -1655,6 +1745,59 @@ export class ProcessManager {
     return null;
   }
 
+  private async isRegisteredComposePortBinding(
+    svc: ISharedServiceRow,
+    occupant: { pid: number; command: string },
+  ): Promise<boolean> {
+    if (!svc.port || !svc.work_dir) return false;
+    try {
+      const workDir = this.canonicalPath(svc.work_dir);
+      const ssot = JSON.parse(fs.readFileSync(path.join(workDir, 'polaris.json'), 'utf8')) as unknown;
+      const identity = composeRuntimeIdentityFromSsot({
+        serviceId: svc.id,
+        registeredCommand: svc.command,
+        serviceWorkDir: workDir,
+        ssot,
+      });
+      if (!identity) return false;
+      const { stdout } = await execFileAsync(
+        'docker',
+        ['ps', '--filter', `publish=${svc.port}`, '--format', '{{.ID}}'],
+        { timeout: 5000, maxBuffer: 64 * 1024 },
+      );
+      const ids = stdout.split(/\s+/u).filter(Boolean);
+      if (ids.length === 0) return false;
+      const inspected = JSON.parse((await execFileAsync(
+        'docker',
+        ['inspect', ...ids],
+        { timeout: 5000, maxBuffer: 2 * 1024 * 1024 },
+      )).stdout) as Array<{
+        State?: { Running?: boolean };
+        Config?: { Labels?: Record<string, string> };
+        HostConfig?: { PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null> };
+      }>;
+      return isManagedComposePortBinding({
+        occupantCommand: occupant.command,
+        serviceWorkDir: workDir,
+        port: svc.port,
+        expectedProject: identity.project,
+        expectedConfigFiles: identity.configFiles,
+        containers: inspected.map((container) => ({
+          state: { running: container.State?.Running === true },
+          labels: container.Config?.Labels ?? {},
+          portBindings: Object.fromEntries(Object.entries(container.HostConfig?.PortBindings ?? {}).map(
+            ([key, bindings]) => [key, bindings?.map((binding) => ({
+              hostIp: binding.HostIp,
+              hostPort: binding.HostPort,
+            })) ?? null],
+          )),
+        })),
+      });
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * 启动前检查端口冲突。
    * - 自己的残留进程 → kill 掉
@@ -1664,6 +1807,20 @@ export class ProcessManager {
   private async ensurePortFree(port: number, serviceId: string): Promise<IServiceActionResult | null> {
     const occupant = await this.getPortOccupantAsync(port);
     if (!occupant) return null;
+
+    const svc = this.db.getService(serviceId);
+    if (!svc) {
+      return { ok: false, message: `端口 ${port} 被占用且服务 ${serviceId} 不存在` };
+    }
+    if (await this.isRegisteredComposePortBinding(svc, occupant)) {
+      this.db.logServiceEvent({
+        service_id: serviceId,
+        service_name: svc.name,
+        event_type: 'script_start',
+        detail: `Keeping registered Compose binding on port ${port}; starting a new PolarProcess foreground supervisor`,
+      });
+      return null;
+    }
 
     const ownSvc = this.isOwnService(occupant);
     if (ownSvc) {
@@ -1687,11 +1844,6 @@ export class ProcessManager {
 
     // ─── 第三方占用 → 自动迁移端口 ─────────────────────────
     console.log(`[Watchdog] 端口 ${port} 被第三方进程占用 (pid=${occupant.pid}, cmd=${occupant.command.slice(0, 80)})`);
-    const svc = this.db.getService(serviceId);
-    if (!svc) {
-      return { ok: false, message: `端口 ${port} 被第三方占用且服务 ${serviceId} 不存在` };
-    }
-
     const newPort = await this.claimPortFromPolarPort({
       service_name: svc.id || svc.name,
       project: this.resolveProject(svc),
@@ -1789,6 +1941,11 @@ export class ProcessManager {
 
     const occupant = await this.getPortOccupantAsync(svc.port);
     if (!occupant) return false;
+    if (await this.isRegisteredComposePortBinding(svc, occupant)) {
+      // Preserve the valid container binding but leave retries to the normal
+      // restart_count/max_restarts path in the caller.
+      return false;
+    }
     const own = this.isOwnService(occupant);
     if (own) {
       try {
@@ -1824,6 +1981,26 @@ export class ProcessManager {
     });
     const cooldown = (this.config.process_manager?.restart_cooldown_sec ?? 10) * 1000;
     setTimeout(() => this.startService(serviceId), cooldown);
+    return true;
+  }
+
+  private async adoptTransientPortOccupant(
+    serviceId: string,
+    serviceName: string,
+    managedPid: number | null,
+    occupant: { pid: number; command: string },
+    port: number,
+  ): Promise<boolean> {
+    if (!(await this.canAdoptPortOccupant(serviceId, occupant, managedPid))) return false;
+    this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
+    this.db.updateServiceRestartCount(serviceId, 0);
+    this.excessiveRestartLogged.delete(serviceId);
+    this.db.logServiceEvent({
+      service_id: serviceId,
+      service_name: serviceName,
+      event_type: 'adopted',
+      detail: `Adopted verified pid=${occupant.pid} on port ${port} after transient EADDRINUSE exhaustion`,
+    });
     return true;
   }
 

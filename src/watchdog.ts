@@ -45,6 +45,22 @@ const DEFAULT_CONFIG: WatchdogConfig = {
   staleSweepIntervalMs: 60_000,
 }
 
+const AUTHORITY_PROJECTS = new Set(['polarport', 'polarprocess'])
+
+export function isAuthorityProject(name: string): boolean {
+  return AUTHORITY_PROJECTS.has(name.trim().toLowerCase())
+}
+
+export function parseSqliteUtcTimestamp(value: string): number | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+
+  const normalized = trimmed.replace(' ', 'T')
+  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(normalized)
+  const parsed = Date.parse(hasExplicitTimezone ? normalized : `${normalized}Z`)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
 export class Watchdog {
   private targets = new Map<string, WatchdogTarget>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -63,6 +79,7 @@ export class Watchdog {
 
     for (const entry of readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue
+      if (isAuthorityProject(entry.name)) continue
       const polarisPath = join(root, entry.name, 'polaris.json')
       if (!existsSync(polarisPath)) continue
 
@@ -73,6 +90,7 @@ export class Watchdog {
         if (!sm?.health_endpoint) continue
 
         const name = polaris.name || entry.name
+        if (isAuthorityProject(name)) continue
         validNames.add(name)
         this.targets.set(name, {
           name,
@@ -179,7 +197,8 @@ export class Watchdog {
 
     const now = Date.now()
     for (const row of ports) {
-      const lastVerified = new Date(row.last_verified).getTime()
+      const lastVerified = parseSqliteUtcTimestamp(row.last_verified)
+      if (lastVerified == null) continue
       if (now - lastVerified < 90_000) continue
 
       const alive = await this.tcpProbe(row.port)

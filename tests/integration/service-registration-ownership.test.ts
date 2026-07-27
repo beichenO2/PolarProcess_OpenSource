@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -113,7 +113,7 @@ describe('service registration ownership', () => {
       const pm = new ProcessManager(serviceDb, {});
       const result = await pm.reconcileServiceChildren('reconcile-test', [stale.pid!]);
 
-      expect(result).toMatchObject({
+      expect(result, result.message).toMatchObject({
         ok: true,
         kept_pid: current.pid,
         reaped_pids: [stale.pid],
@@ -195,6 +195,138 @@ describe('service registration ownership', () => {
       await new Promise(resolve => setTimeout(resolve, 20));
       for (const pid of new Set([firstPid, secondPid])) {
         if (!pid) continue;
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it('preserves the failure budget while a retry is only starting', async () => {
+    const serviceId = 'retry-budget-preservation-test';
+    const pm = new ProcessManager(serviceDb, { process_manager: { startup_grace_sec: 0 } });
+    let pid: number | undefined;
+    try {
+      serviceDb.registerService({
+        id: serviceId,
+        name: 'Retry Budget Preservation Test',
+        command: 'sleep 30',
+        work_dir: TEST_DIR,
+        device_id: 'any',
+        start_script_dir: '-',
+        restart_on_failure: true,
+        max_restarts: 1,
+      });
+      serviceDb.updateServiceStatus(serviceId, 'error', { restart_count: 1 });
+
+      const result = await pm.startService(serviceId);
+      pid = result.pid;
+
+      expect(result).toMatchObject({ ok: true, pid: expect.any(Number) });
+      expect(serviceDb.getService(serviceId)?.restart_count).toBe(1);
+    } finally {
+      await pm.stopService(serviceId);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it('refuses to adopt an unverified listener after transient retries are exhausted', async () => {
+    const serviceId = 'transient-adoption-guard-test';
+    serviceDb.registerService({
+      id: serviceId,
+      name: 'Transient Adoption Guard Test',
+      command: 'sleep 30',
+      work_dir: TEST_DIR,
+      device_id: 'any',
+      start_script_dir: '-',
+      restart_on_failure: true,
+      max_restarts: 1,
+      port: 18005,
+    });
+    serviceDb.updateServiceStatus(serviceId, 'error', { restart_count: 1 });
+    const pm = new ProcessManager(serviceDb, {});
+    (pm as any).canAdoptPortOccupant = async () => false;
+
+    const adopted = await (pm as any).adoptTransientPortOccupant(
+      serviceId,
+      'Transient Adoption Guard Test',
+      1234,
+      { pid: 999_999, command: 'unrelated-listener' },
+      18005,
+    );
+
+    expect(adopted).toBe(false);
+    expect(serviceDb.getService(serviceId)).toMatchObject({
+      status: 'error',
+      pid: null,
+      restart_count: 1,
+    });
+  });
+
+  it('does not revive a service stopped while a health scan holds a stale running snapshot', async () => {
+    const serviceId = 'stale-health-stop-test';
+    const isolatedDir = path.join(os.tmpdir(), `polarprocess-stale-stop-${Date.now()}`);
+    const schemaOwner = new SOTAgentDB(isolatedDir);
+    schemaOwner.close();
+    const isolatedDb = new ServiceDB(path.join(isolatedDir, 'resources.sqlite'));
+    isolatedDb.registerService({
+      id: serviceId,
+      name: 'Stale Health Stop Test',
+      command: 'sleep 30',
+      work_dir: isolatedDir,
+      device_id: 'any',
+      start_script_dir: '-',
+      auto_start: false,
+      restart_on_failure: true,
+      max_restarts: 1,
+    });
+    isolatedDb.updateServiceStatus(serviceId, 'running', { pid: 2_147_483_647 });
+    const pm = new ProcessManager(isolatedDb, {});
+
+    vi.useFakeTimers();
+    try {
+      const scan = (pm as any).runHealthChecksInner();
+      isolatedDb.updateServiceStatus(serviceId, 'stopped');
+      await vi.advanceTimersByTimeAsync(60);
+      await scan;
+
+      expect(isolatedDb.getService(serviceId)).toMatchObject({
+        status: 'stopped',
+        restart_count: 0,
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      isolatedDb.close();
+      fs.rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a service stopped before waiting for its child to exit', async () => {
+    const serviceId = 'stop-state-before-signal-test';
+    const pm = new ProcessManager(serviceDb, { process_manager: { startup_grace_sec: 0 } });
+    let pid: number | undefined;
+    try {
+      serviceDb.registerService({
+        id: serviceId,
+        name: 'Stop State Before Signal Test',
+        command: 'sleep 30',
+        work_dir: TEST_DIR,
+        device_id: 'any',
+        start_script_dir: '-',
+      });
+      const started = await pm.startService(serviceId);
+      pid = started.pid;
+      expect(started.ok).toBe(true);
+
+      const stopping = pm.stopService(serviceId);
+      const statusWhileStopping = serviceDb.getService(serviceId)?.status;
+      await stopping;
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(statusWhileStopping).toBe('stopped');
+    } finally {
+      if (pid) {
         try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
       }
     }

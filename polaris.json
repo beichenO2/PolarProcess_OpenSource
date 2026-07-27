@@ -249,6 +249,28 @@
           "evidence": [
             "2026-06-10: feature verified in codebase (L2 gate audit backfill)"
           ]
+        },
+        {
+          "name": "运行时权威租约、bootstrap 与有界重启边界",
+          "status": "done",
+          "test_status": "passed",
+          "behavior": [
+            "SQLite 无时区时间戳按 UTC 解释，避免新租约被提前释放",
+            "PolarPort 与 PolarProcess 仅由 launchd bootstrap 管理，不进入应用 Watchdog",
+            "自动重试启动不得提前清零 restart_count；仅在稳定运行或已验证采纳后恢复预算",
+            "transient EADDRINUSE 耗尽后只采纳可验证的同服务监听者，绝不采纳 Docker backend 或第三方 PID",
+            "健康扫描写入 crash/restart 前必须重读 live row，显式 stop 的新状态优先于旧 running 快照",
+            "stopService 在等待 child/stop 脚本前先发布 stopped，消除停止窗口的自动复活竞态"
+          ],
+          "evidence": [
+            "2026-07-27: 根因复现为 UTC 时间按 Asia/Shanghai 本地时间解析；Sub2API 8085 暖机期间被 stale sweep 释放",
+            "2026-07-27: PolarProcess 内部 Watchdog 曾对自身执行 npm start 并得到 EADDRINUSE",
+            "2026-07-27: 新增 UTC/显式时区/非法时间与 authority 精确过滤 4 项回归测试；红态 4/4 失败，绿态 4/4 通过",
+            "2026-07-27: npm test 42/42 passed；npm run build、git diff --check 与 polaris.json 解析通过",
+            "2026-07-27: 两项 P1 回归先红态复现 restart_count 1→0 与无条件 listener adoption；绿态定向 9/9、全量 47/47、TypeScript build、SSoT parse 与 diff check 通过",
+            "2026-07-27: 隔离并发回归红态复现 explicit stopped 被旧健康扫描改回 starting/restart_count=1；live-row guard 后定向 10/10 通过",
+            "2026-07-27: stop-state 回归先红态观察等待 child 期间 status=running；提前发布 stopped 后定向 11/11 通过"
+          ]
         }
       ]
     },
