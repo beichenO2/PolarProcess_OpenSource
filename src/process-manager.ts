@@ -871,7 +871,9 @@ export class ProcessManager {
       });
 
       this.db.updateServiceStatus(serviceId, 'running', { pid: child.pid });
-      this.transientRetryCount.delete(`transient_retry_${serviceId}`);
+      if (!freshSvc.port) {
+        this.clearTransientRetryCount(serviceId);
+      }
 
       // 启动后端口验证：确保进程绑定了正确的端口
       // 给服务 30 秒的启动 grace period（Python/Node 可能需要较长时间加载模块）
@@ -914,6 +916,17 @@ export class ProcessManager {
     return false;
   }
 
+  private getExactRegisteredServiceId(occupantPid: number): string | null {
+    for (const svc of this.db.listServices()) {
+      if (svc.pid === occupantPid) return svc.id;
+    }
+    return null;
+  }
+
+  private clearTransientRetryCount(serviceId: string): void {
+    this.transientRetryCount.delete(`transient_retry_${serviceId}`);
+  }
+
   private async canAdoptPortOccupant(
     serviceId: string,
     occupant: { pid: number; command: string },
@@ -921,7 +934,7 @@ export class ProcessManager {
   ): Promise<boolean> {
     const occupantIsDescendant = managedPid != null &&
       await this.isDescendantOf(occupant.pid, managedPid);
-    const matchedServiceId = this.isOwnService(occupant)?.serviceId ?? null;
+    const matchedServiceId = this.getExactRegisteredServiceId(occupant.pid);
     return isManagedPortOccupant({
       serviceId,
       managedPid,
@@ -945,6 +958,7 @@ export class ProcessManager {
       if (occupant) {
         // 端口有监听者
         if (occupant.pid === pid) {
+          this.clearTransientRetryCount(serviceId);
           return; // exact match
         }
 
@@ -956,11 +970,13 @@ export class ProcessManager {
             event_type: 'pid_updated',
             detail: `PID corrected: wrapper ${pid} → descendant listener ${occupant.pid}`,
           });
+          this.clearTransientRetryCount(serviceId);
           return;
         }
 
         const service = this.db.getService(serviceId);
         if (service && await this.isRegisteredComposePortBinding(service, occupant)) {
+          this.clearTransientRetryCount(serviceId);
           return;
         }
 
@@ -1991,8 +2007,12 @@ export class ProcessManager {
     occupant: { pid: number; command: string },
     port: number,
   ): Promise<boolean> {
-    if (!(await this.canAdoptPortOccupant(serviceId, occupant, managedPid))) return false;
+    const svc = this.db.getService(serviceId);
+    const verified = await this.canAdoptPortOccupant(serviceId, occupant, managedPid) ||
+      (svc != null && await this.isRegisteredComposePortBinding(svc, occupant));
+    if (!verified) return false;
     this.db.updateServiceStatus(serviceId, 'running', { pid: occupant.pid });
+    this.clearTransientRetryCount(serviceId);
     this.db.updateServiceRestartCount(serviceId, 0);
     this.excessiveRestartLogged.delete(serviceId);
     this.db.logServiceEvent({

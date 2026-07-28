@@ -303,6 +303,72 @@ describe('service registration ownership', () => {
     }
   });
 
+  it('preserves transient EADDRINUSE counter until port binding is verified', async () => {
+    const serviceId = 'transient-counter-preserve-test';
+    serviceDb.registerService({
+      id: serviceId,
+      name: 'Transient Counter Preserve Test',
+      command: 'sleep 30',
+      work_dir: TEST_DIR,
+      device_id: 'any',
+      start_script_dir: '-',
+      port: 18007,
+    });
+    const pm = new ProcessManager(serviceDb, { process_manager: { startup_grace_sec: 0 } });
+    const counter = (pm as any).transientRetryCount as Map<string, number>;
+    counter.set(`transient_retry_${serviceId}`, 2);
+    let pid: number | undefined;
+    try {
+      const result = await pm.startService(serviceId);
+      pid = result.pid;
+      expect(result.ok).toBe(true);
+      expect(counter.get(`transient_retry_${serviceId}`)).toBe(2);
+    } finally {
+      await pm.stopService(serviceId);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it('does not adopt a listener matched only by work_dir path heuristics', async () => {
+    const serviceId = 'workdir-heuristic-guard-test';
+    serviceDb.registerService({
+      id: serviceId,
+      name: 'Workdir Heuristic Guard Test',
+      command: 'node server.js',
+      work_dir: TEST_DIR,
+      device_id: 'any',
+      start_script_dir: '-',
+      restart_on_failure: true,
+      max_restarts: 2,
+      port: 18008,
+    });
+    serviceDb.updateServiceStatus(serviceId, 'error', { restart_count: 1 });
+    const pm = new ProcessManager(serviceDb, {});
+    const occupant = {
+      pid: 888_888,
+      command: `node ${TEST_DIR}/unrelated-listener.js`,
+    };
+
+    const canAdopt = await (pm as any).canAdoptPortOccupant(serviceId, occupant, 1234);
+    const adopted = await (pm as any).adoptTransientPortOccupant(
+      serviceId,
+      'Workdir Heuristic Guard Test',
+      1234,
+      occupant,
+      18008,
+    );
+
+    expect(canAdopt).toBe(false);
+    expect(adopted).toBe(false);
+    expect(serviceDb.getService(serviceId)).toMatchObject({
+      status: 'error',
+      restart_count: 1,
+    });
+  });
+
   it('marks a service stopped before waiting for its child to exit', async () => {
     const serviceId = 'stop-state-before-signal-test';
     const pm = new ProcessManager(serviceDb, { process_manager: { startup_grace_sec: 0 } });
