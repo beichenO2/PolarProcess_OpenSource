@@ -85,6 +85,63 @@ export interface IServiceReconcileResult {
   reaped_pids: number[];
 }
 
+/** Read-only port probe — safe substitute for `lsof -iTCP:PORT -sTCP:LISTEN`. */
+export interface IPortDiagnostic {
+  port: number;
+  free: boolean;
+  occupant: { pid: number; command: string; alive: boolean } | null;
+  own_service: { service_id: string; service_name: string } | null;
+  registered_service: {
+    service_id: string;
+    service_name: string;
+    status: string;
+    pid: number | null;
+  } | null;
+}
+
+export interface IProcessProbe {
+  pid: number;
+  alive: boolean;
+  command?: string;
+  ppid?: number;
+  cwd?: string;
+  managed_service?: { service_id: string; service_name: string };
+}
+
+export interface IEnsurePortReadyResult extends IServiceActionResult {
+  action?: 'none' | 'cleared_own_residual' | 'migrated_port' | 'compose_binding_kept' | 'clear_failed' | 'migration_failed';
+  port?: number;
+  previous_port?: number;
+}
+
+/** Result of polling until a port is free — safe substitute for `sleep; lsof || echo port free`. */
+export interface IWaitPortFreeResult {
+  ok: boolean;
+  message: string;
+  port: number;
+  free: boolean;
+  waited_ms: number;
+  occupant: IPortDiagnostic['occupant'];
+}
+
+/** Stop + port release verification — safe substitute for `stop; sleep; lsof`. */
+export interface IStopAndVerifyResult extends IServiceActionResult {
+  port?: number;
+  port_free?: boolean;
+  waited_ms?: number;
+  cleared_residual?: boolean;
+}
+
+/** One TCP listener with managed-service ownership context. */
+export interface IListeningPortEntry {
+  port: number;
+  pid: number;
+  command: string;
+  alive: boolean;
+  registered_service: IPortDiagnostic['registered_service'];
+  own_service: IPortDiagnostic['own_service'];
+}
+
 interface IManagedProcessIdentity {
   pid: number;
   ppid: number;
@@ -2209,6 +2266,422 @@ export class ProcessManager {
     }
   }
 
+  /** Safe substitute for `lsof -iTCP:PORT -sTCP:LISTEN` (+ ownership context). */
+  async getPortDiagnostic(port: number): Promise<IPortDiagnostic> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('invalid_port');
+    }
+    const occupantRaw = await this.getPortOccupantAsync(port);
+    const occupant = occupantRaw
+      ? { ...occupantRaw, alive: this.isProcessAlive(occupantRaw.pid) }
+      : null;
+    const ownService = occupant ? this.isOwnService(occupant) : null;
+    const registered = this.db.listServices().find(s => s.port === port);
+    return {
+      port,
+      free: occupant == null,
+      occupant,
+      own_service: ownService
+        ? { service_id: ownService.serviceId, service_name: ownService.serviceName }
+        : null,
+      registered_service: registered
+        ? {
+            service_id: registered.id,
+            service_name: registered.name,
+            status: registered.status,
+            pid: registered.pid,
+          }
+        : null,
+    };
+  }
+
+  /** Per-service port view — safe substitute for service-scoped lsof checks. */
+  async getServicePortStatus(serviceId: string): Promise<IPortDiagnostic | IServiceActionResult> {
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在` };
+    if (!svc.port) {
+      return {
+        ok: false,
+        message: `服务 ${svc.name} 未配置端口`,
+      };
+    }
+    return this.getPortDiagnostic(svc.port);
+  }
+
+  /**
+   * Kill only a PolarProcess-managed residual on a port.
+   * Safe substitute for `kill PID; sleep; lsof …` when the occupant is own-service.
+   */
+  async clearOwnPortOccupant(port: number): Promise<IServiceActionResult & { action: string }> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { ok: false, message: 'invalid port', action: 'rejected' };
+    }
+    const occupant = await this.getPortOccupantAsync(port);
+    if (!occupant) {
+      return { ok: true, message: `端口 ${port} 已空闲`, action: 'none' };
+    }
+    const ownSvc = this.isOwnService(occupant);
+    if (!ownSvc) {
+      return {
+        ok: false,
+        message: `端口 ${port} 被第三方占用 (pid=${occupant.pid})，拒绝清理`,
+        action: 'rejected_third_party',
+      };
+    }
+    try {
+      process.kill(occupant.pid, 'SIGTERM');
+      await new Promise(r => setTimeout(r, 2000));
+      if (this.isProcessAlive(occupant.pid)) {
+        process.kill(occupant.pid, 'SIGKILL');
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } catch { /* already exited */ }
+    this.db.updateServiceStatus(ownSvc.serviceId, 'stopped');
+    const stillOccupied = await this.getPortOccupantAsync(port);
+    if (stillOccupied) {
+      return {
+        ok: false,
+        message: `端口 ${port} 清理失败：残留进程 pid=${occupant.pid} 仍在监听`,
+        action: 'clear_failed',
+      };
+    }
+    return {
+      ok: true,
+      message: `端口 ${port} 已清理 (${ownSvc.serviceName} 残留 pid=${occupant.pid})`,
+      action: 'cleared_own_residual',
+    };
+  }
+
+  /**
+   * Pre-start port hygiene for a registered service.
+   * Safe substitute for kill+lsof before `start`.
+   */
+  async ensureServicePortReady(serviceId: string): Promise<IEnsurePortReadyResult> {
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在` };
+    if (!svc.port) return { ok: true, message: `服务 ${svc.name} 无端口约束`, action: 'none' };
+
+    const beforePort = svc.port;
+    const occupant = await this.getPortOccupantAsync(beforePort);
+    if (!occupant) {
+      return { ok: true, message: `端口 ${beforePort} 已就绪`, action: 'none', port: beforePort };
+    }
+
+    if (await this.isRegisteredComposePortBinding(svc, occupant)) {
+      return {
+        ok: true,
+        message: `端口 ${beforePort} 由已注册 Compose 绑定占用，保持不动`,
+        action: 'compose_binding_kept',
+        port: beforePort,
+      };
+    }
+
+    const ownSvc = this.isOwnService(occupant);
+    if (ownSvc) {
+      const cleared = await this.clearOwnPortOccupant(beforePort);
+      return {
+        ...cleared,
+        action: cleared.ok ? 'cleared_own_residual' : 'clear_failed',
+        port: beforePort,
+      };
+    }
+
+    const conflict = await this.ensurePortFree(beforePort, serviceId);
+    const after = this.db.getService(serviceId);
+    const afterPort = after?.port ?? beforePort;
+    if (conflict && !conflict.ok) {
+      return { ...conflict, action: 'migration_failed', port: afterPort, previous_port: beforePort };
+    }
+    if (afterPort !== beforePort) {
+      return {
+        ok: true,
+        message: `端口 ${beforePort} 被第三方占用，已迁移至 ${afterPort}`,
+        action: 'migrated_port',
+        port: afterPort,
+        previous_port: beforePort,
+      };
+    }
+    return { ok: true, message: `端口 ${beforePort} 已就绪`, action: 'none', port: beforePort };
+  }
+
+  /** Read-only PID probe — safe substitute for `kill -0` + `ps -p`. */
+  async probeProcess(pid: number): Promise<IProcessProbe> {
+    if (!Number.isSafeInteger(pid) || pid <= 1) {
+      return { pid, alive: false };
+    }
+    const alive = this.isProcessAlive(pid);
+    if (!alive) return { pid, alive: false };
+
+    const identity = await this.readManagedProcessIdentity(pid);
+    const services = this.db.listServices();
+    const managed = services.find(s => s.pid === pid);
+
+    return {
+      pid,
+      alive: true,
+      command: identity?.command,
+      ppid: identity?.ppid,
+      cwd: identity?.cwd,
+      managed_service: managed
+        ? { service_id: managed.id, service_name: managed.name }
+        : undefined,
+    };
+  }
+
+  getProcessById(id: string): IProcessStatus | null {
+    return this.getAllStatus().find(p => p.id === id) ?? null;
+  }
+
+  /** Scoped kill — delegates to stopService; id is a managed service id, not a raw PID. */
+  async killManagedProcess(id: string): Promise<IServiceActionResult> {
+    return this.stopService(id);
+  }
+
+  /**
+   * Poll until a port has no TCP listener or timeout.
+   * Safe substitute for `sleep 1; lsof -iTCP:PORT -sTCP:LISTEN || echo "port free"`.
+   */
+  async waitForPortFree(
+    port: number,
+    options?: { timeout_ms?: number; interval_ms?: number },
+  ): Promise<IWaitPortFreeResult> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return {
+        ok: false,
+        message: 'invalid port',
+        port,
+        free: false,
+        waited_ms: 0,
+        occupant: null,
+      };
+    }
+    const timeoutMs = Math.min(Math.max(options?.timeout_ms ?? 10_000, 100), 60_000);
+    const intervalMs = Math.min(Math.max(options?.interval_ms ?? 500, 100), 5_000);
+    const started = Date.now();
+    let occupant: IPortDiagnostic['occupant'] = null;
+
+    while (Date.now() - started < timeoutMs) {
+      const raw = await this.getPortOccupantAsync(port);
+      if (!raw) {
+        return {
+          ok: true,
+          message: `端口 ${port} 已空闲`,
+          port,
+          free: true,
+          waited_ms: Date.now() - started,
+          occupant: null,
+        };
+      }
+      occupant = { ...raw, alive: this.isProcessAlive(raw.pid) };
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+
+    return {
+      ok: false,
+      message: `端口 ${port} 在 ${timeoutMs}ms 内仍被占用 (pid=${occupant?.pid ?? 'unknown'})`,
+      port,
+      free: false,
+      waited_ms: Date.now() - started,
+      occupant,
+    };
+  }
+
+  /**
+   * Clear own residual then verify the port is free.
+   * Safe substitute for `kill PID; sleep 1; lsof … || echo "port free"`.
+   */
+  async clearOwnPortOccupantAndVerify(port: number): Promise<IWaitPortFreeResult & { action: string }> {
+    const cleared = await this.clearOwnPortOccupant(port);
+    if (!cleared.ok && cleared.action !== 'none') {
+      return {
+        ok: false,
+        message: cleared.message,
+        port,
+        free: false,
+        waited_ms: 0,
+        occupant: (await this.getPortDiagnostic(port)).occupant,
+        action: cleared.action,
+      };
+    }
+    const waited = await this.waitForPortFree(port, { timeout_ms: 5_000, interval_ms: 300 });
+    return {
+      ...waited,
+      message: waited.free
+        ? (cleared.action === 'cleared_own_residual'
+          ? `端口 ${port} 残留已清理并确认空闲`
+          : waited.message)
+        : waited.message,
+      action: cleared.action === 'none' ? 'none' : (waited.free ? 'cleared_and_verified' : 'clear_unverified'),
+    };
+  }
+
+  /** Batch port probe — safe substitute for shell loops over multiple ports. */
+  async getBatchPortDiagnostics(ports: number[]): Promise<IPortDiagnostic[]> {
+    const unique = [...new Set(ports.filter(p => Number.isInteger(p) && p >= 1 && p <= 65535))];
+    const results: IPortDiagnostic[] = [];
+    for (const port of unique) {
+      results.push(await this.getPortDiagnostic(port));
+    }
+    return results;
+  }
+
+  /** Reverse lookup: registered service that owns a configured port. */
+  findServiceByPort(port: number): IProcessStatus | null {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    const svc = this.db.listServices(this.localDeviceId).find(s => s.port === port);
+    return svc ? this.getProcessById(svc.id) : null;
+  }
+
+  /**
+   * Stop a service and verify its port is released (optionally clearing own residual).
+   * Safe substitute for `curl …/stop; sleep 2; lsof … || echo "port free"`.
+   */
+  async stopAndVerifyPort(
+    serviceId: string,
+    options?: { timeout_ms?: number; clear_own_residual?: boolean },
+  ): Promise<IStopAndVerifyResult> {
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在` };
+
+    const stopResult = await this.stopService(serviceId);
+    if (!stopResult.ok) return stopResult;
+    if (!svc.port) {
+      return { ok: true, message: `服务 ${svc.name} 已停止（无端口约束）`, port_free: true };
+    }
+
+    const clearOwn = options?.clear_own_residual !== false;
+    let totalWaited = 0;
+    let waitResult = await this.waitForPortFree(svc.port, {
+      timeout_ms: options?.timeout_ms ?? 10_000,
+    });
+    totalWaited += waitResult.waited_ms;
+
+    if (!waitResult.free && clearOwn) {
+      const cleared = await this.clearOwnPortOccupant(svc.port);
+      if (cleared.ok && cleared.action === 'cleared_own_residual') {
+        waitResult = await this.waitForPortFree(svc.port, { timeout_ms: 5_000, interval_ms: 300 });
+        totalWaited += waitResult.waited_ms;
+        if (waitResult.free) {
+          return {
+            ok: true,
+            message: `服务 ${svc.name} 已停止，端口 ${svc.port} 残留已清理并确认空闲`,
+            port: svc.port,
+            port_free: true,
+            waited_ms: totalWaited,
+            cleared_residual: true,
+          };
+        }
+      }
+    }
+
+    if (waitResult.free) {
+      return {
+        ok: true,
+        message: `服务 ${svc.name} 已停止，端口 ${svc.port} 已释放`,
+        port: svc.port,
+        port_free: true,
+        waited_ms: totalWaited,
+      };
+    }
+
+    return {
+      ok: false,
+      message: `服务 ${svc.name} 已停止，但端口 ${svc.port} 仍被占用 (pid=${waitResult.occupant?.pid ?? 'unknown'})`,
+      port: svc.port,
+      port_free: false,
+      waited_ms: totalWaited,
+    };
+  }
+
+  /**
+   * Pre-start hygiene then restart — safe substitute for kill+sleep+lsof+restart shell chains.
+   */
+  async restartClean(serviceId: string): Promise<IServiceActionResult & { port_ready?: IEnsurePortReadyResult }> {
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `服务 ${serviceId} 不存在` };
+
+    const portReady = await this.ensureServicePortReady(serviceId);
+    if (!portReady.ok) {
+      return { ok: false, message: portReady.message, port_ready: portReady };
+    }
+    const restart = await this.restartService(serviceId);
+    return { ...restart, port_ready: portReady };
+  }
+
+  /**
+   * All TCP listeners with managed-service ownership — safe substitute for `lsof -iTCP -sTCP:LISTEN`.
+   */
+  async listListeningPorts(): Promise<IListeningPortEntry[]> {
+    const listeners = await this.scanAllListeningPorts();
+    const entries: IListeningPortEntry[] = [];
+    for (const { pid, port, command } of listeners) {
+      const alive = this.isProcessAlive(pid);
+      const occupant = { pid, command, alive };
+      const registered = this.db.listServices(this.localDeviceId).find(s => s.port === port);
+      entries.push({
+        port,
+        pid,
+        command,
+        alive,
+        own_service: (() => {
+          const own = this.isOwnService(occupant);
+          return own
+            ? { service_id: own.serviceId, service_name: own.serviceName }
+            : null;
+        })(),
+        registered_service: registered
+          ? {
+              service_id: registered.id,
+              service_name: registered.name,
+              status: registered.status,
+              pid: registered.pid,
+            }
+          : null,
+      });
+    }
+    return entries.sort((a, b) => a.port - b.port || a.pid - b.pid);
+  }
+
+  /** Parse `lsof -F` output for all TCP listeners. Shared by orphan scan and diagnostics. */
+  private async scanAllListeningPorts(): Promise<Array<{ pid: number; port: number; command: string }>> {
+    let listenLines: string;
+    try {
+      const { stdout } = await execAsync(
+        `${ProcessManager.LSOF} -iTCP -sTCP:LISTEN -P -n -F pn 2>/dev/null`,
+        { timeout: 5000 },
+      );
+      listenLines = stdout;
+    } catch {
+      return [];
+    }
+
+    const listeners = new Map<number, Set<number>>();
+    let currentPid = 0;
+    for (const line of listenLines.split('\n')) {
+      if (line.startsWith('p')) {
+        currentPid = parseInt(line.slice(1), 10);
+        if (!listeners.has(currentPid)) listeners.set(currentPid, new Set());
+      } else if (line.startsWith('n') && currentPid) {
+        const match = line.match(/:(\d+)$/);
+        if (match?.[1]) listeners.get(currentPid)!.add(parseInt(match[1], 10));
+      }
+    }
+
+    const results: Array<{ pid: number; port: number; command: string }> = [];
+    for (const [pid, ports] of listeners) {
+      if (pid === process.pid) continue;
+      let command = '';
+      try {
+        const { stdout } = await execAsync(`ps -p ${pid} -o command= 2>/dev/null || true`, { timeout: 3000 });
+        command = stdout.trim();
+      } catch { /* process may have exited */ }
+      for (const port of ports) {
+        results.push({ pid, port, command });
+      }
+    }
+    return results;
+  }
+
   /** 检查所有注册服务的端口冲突状态 */
   async checkAllPortConflicts(): Promise<Array<{
     serviceId: string;
@@ -2298,27 +2771,12 @@ export class ProcessManager {
    * Unregistered listeners are logged as warnings. Orphans surviving past grace period are killed.
    */
   private async scanOrphanProcesses(): Promise<void> {
-    let listenLines: string;
-    try {
-      const { stdout } = await execAsync(
-        `${ProcessManager.LSOF} -iTCP -sTCP:LISTEN -P -n -F pn 2>/dev/null`,
-        { timeout: 5000 },
-      );
-      listenLines = stdout;
-    } catch {
-      return;
-    }
-
-    const listeners = new Map<number, Set<number>>();
-    let currentPid = 0;
-    for (const line of listenLines.split('\n')) {
-      if (line.startsWith('p')) {
-        currentPid = parseInt(line.slice(1), 10);
-        if (!listeners.has(currentPid)) listeners.set(currentPid, new Set());
-      } else if (line.startsWith('n') && currentPid) {
-        const match = line.match(/:(\d+)$/);
-        if (match?.[1]) listeners.get(currentPid)!.add(parseInt(match[1], 10));
-      }
+    const listeners = await this.scanAllListeningPorts();
+    const listenersByPid = new Map<number, Array<{ port: number; command: string }>>();
+    for (const entry of listeners) {
+      const bucket = listenersByPid.get(entry.pid) ?? [];
+      bucket.push({ port: entry.port, command: entry.command });
+      listenersByPid.set(entry.pid, bucket);
     }
 
     const services = this.db.listServices(this.localDeviceId);
@@ -2330,20 +2788,13 @@ export class ProcessManager {
     const now = Date.now();
     const activeOrphans = new Set<number>();
 
-    for (const [pid, ports] of listeners) {
-      if (pid === process.pid) continue;
-
-      for (const port of ports) {
+    for (const [pid, portEntries] of listenersByPid) {
+      for (const { port, command } of portEntries) {
         const svc = registeredPorts.get(port);
         if (!svc) continue; // unregistered port — not our concern
 
         if (svc.status === 'running' && svc.pid === pid) continue; // legitimate service
 
-        let command = '';
-        try {
-          const { stdout } = await execAsync(`ps -p ${pid} -o command= 2>/dev/null || true`, { timeout: 3000 });
-          command = stdout.trim();
-        } catch { /* process may have exited */ }
         const occupant = { pid, command };
         const managed = await this.canAdoptPortOccupant(svc.id, occupant, svc.pid);
         if (!managed) continue; // external proxy or third-party listener: never signal it

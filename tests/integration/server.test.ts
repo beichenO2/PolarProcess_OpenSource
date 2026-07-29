@@ -190,6 +190,174 @@ describe('PolarProcess integration', () => {
       expect(res.status).toBe(404);
     });
 
+    it('GET /api/processes returns array', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/processes'));
+      const body = await res.json();
+      expect(Array.isArray(body)).toBe(true);
+    });
+
+    it('GET /api/diagnostics/ports/:port returns port diagnostic', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/ports/17335'));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.port).toBe(17335);
+      expect(typeof body.free).toBe('boolean');
+    });
+
+    it('GET /api/diagnostics/ports/:port rejects invalid port', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/ports/0'));
+      expect(res.status).toBe(400);
+    });
+
+    it('GET /api/diagnostics/port-conflicts returns conflicts array', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/port-conflicts'));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(Array.isArray(body.conflicts)).toBe(true);
+    });
+
+    it('POST /api/diagnostics/ports/:port/clear-own on free port succeeds', async () => {
+      const app = createApp(db, serviceDb);
+      let freePort: number | null = null;
+      for (let port = 19995; port >= 19900; port -= 5) {
+        const probe = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${port}`));
+        const diag = await probe.json();
+        if (diag.free) {
+          freePort = port;
+          break;
+        }
+      }
+      expect(freePort).not.toBeNull();
+      const res = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${freePort}/clear-own`, {
+        method: 'POST',
+      }));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.action).toBe('none');
+    });
+
+    it('GET /api/diagnostics/process/:pid probes process', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/process/2'));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.pid).toBe(2);
+      expect(typeof body.alive).toBe('boolean');
+    });
+
+    it('GET /api/diagnostics/listening-ports returns listeners array', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/listening-ports'));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(Array.isArray(body.listeners)).toBe(true);
+    });
+
+    it('GET /api/diagnostics/ports-batch returns diagnostics array', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/ports-batch?ports=17335,19900'));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(Array.isArray(body.diagnostics)).toBe(true);
+      expect(body.diagnostics.length).toBe(2);
+    });
+
+    it('GET /api/diagnostics/ports-batch rejects empty ports', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/diagnostics/ports-batch'));
+      expect(res.status).toBe(400);
+    });
+
+    it('POST /api/diagnostics/ports/:port/wait-free succeeds on free port', async () => {
+      const app = createApp(db, serviceDb);
+      let freePort: number | null = null;
+      for (let port = 19995; port >= 19900; port -= 5) {
+        const probe = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${port}`));
+        const diag = await probe.json();
+        if (diag.free) {
+          freePort = port;
+          break;
+        }
+      }
+      expect(freePort).not.toBeNull();
+      const res = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${freePort}/wait-free`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeout_ms: 1000 }),
+      }));
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.free).toBe(true);
+    });
+
+    it('POST /api/diagnostics/ports/:port/clear-and-verify on free port succeeds', async () => {
+      const app = createApp(db, serviceDb);
+      let freePort: number | null = null;
+      for (let port = 19995; port >= 19900; port -= 5) {
+        const probe = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${port}`));
+        const diag = await probe.json();
+        if (diag.free) {
+          freePort = port;
+          break;
+        }
+      }
+      expect(freePort).not.toBeNull();
+      const res = await app.fetch(new Request(`http://localhost/api/diagnostics/ports/${freePort}/clear-and-verify`, {
+        method: 'POST',
+      }));
+      const body = await res.json();
+      expect(body.free).toBe(true);
+      expect(body.action).toBe('none');
+    });
+
+    it('GET /api/services/by-port/:port returns 404 when unregistered', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/services/by-port/19999'));
+      expect(res.status).toBe(404);
+    });
+
+    it('POST /api/services/:id/stop-and-verify returns 404 for missing service', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/services/missing-svc/stop-and-verify', {
+        method: 'POST',
+      }));
+      expect(res.status).toBe(404);
+    });
+
+    it('POST /api/services/:id/restart-clean returns 404 for missing service', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/services/missing-svc/restart-clean', {
+        method: 'POST',
+      }));
+      expect(res.status).toBe(404);
+    });
+
+    it('GET /api/services/:id/port-status returns 404 for missing service', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/services/missing-svc/port-status'));
+      expect(res.status).toBe(404);
+    });
+
+    it('POST /api/services/:id/ensure-port-ready returns 404 for missing service', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/services/missing-svc/ensure-port-ready', {
+        method: 'POST',
+      }));
+      expect(res.status).toBe(404);
+    });
+
+    it('POST /api/processes/:id/kill returns 404 for unknown id', async () => {
+      const app = createApp(db, serviceDb);
+      const res = await app.fetch(new Request('http://localhost/api/processes/nonexistent/kill', {
+        method: 'POST',
+      }));
+      expect(res.status).toBe(404);
+    });
+
     it('POST /api/services/:id/start returns result', async () => {
       const app = createApp(db, serviceDb);
       const res = await app.fetch(new Request('http://localhost/api/services/integration-test-svc/start', { method: 'POST' }));

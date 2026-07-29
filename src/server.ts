@@ -16,6 +16,11 @@ import { ProcessManager, type IProcessStatus, type IServiceActionResult, type IP
 import { ResourceScheduler } from './scheduler.js';
 import { ResourceProfiler } from './profiler.js';
 import { Watchdog } from './watchdog.js';
+import { bootstrapOutboundProxy, getProxyEnvSnapshot } from './proxy-env.js';
+import {
+  notifyPolarBudgetRegister,
+  notifyPolarBudgetUnregister,
+} from './polar-budget-notify.js';
 
 const DATA_DIR = process.env.POLARPROCESS_DATA_DIR
   ?? path.join(process.env.HOME ?? '', 'Polarisor', 'PolarProcess', 'data');
@@ -48,6 +53,20 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
 
   // ─── Health ──────────────────────────────────────
   app.get('/api/health', (c) => c.json({ ok: true, service: 'polar-process' }));
+
+  app.get('/api/runtime/proxy', (c) => {
+    const snapshot = getProxyEnvSnapshot();
+    return c.json({
+      ok: true,
+      proxy: snapshot ?? { mode: 'unknown', applied: false, source: 'none' },
+      processEnv: {
+        HTTP_PROXY: process.env.HTTP_PROXY ?? null,
+        HTTPS_PROXY: process.env.HTTPS_PROXY ?? null,
+        NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY ?? null,
+        NO_PROXY: process.env.NO_PROXY ?? null,
+      },
+    });
+  });
 
   // ─── Tasks ───────────────────────────────────────
   app.get('/api/tasks', (c) => {
@@ -124,6 +143,16 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     return c.json(services);
   });
 
+  app.get('/api/services/by-port/:port', (c) => {
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ ok: false, message: 'invalid port' }, 400);
+    }
+    const svc = pm.findServiceByPort(port);
+    if (!svc) return c.json({ ok: false, message: `no registered service on port ${port}` }, 404);
+    return c.json({ ok: true, service: svc, port });
+  });
+
   app.get('/api/services/:id', (c) => {
     const id = c.req.param('id');
     const svc = serviceDb.getService(id);
@@ -134,18 +163,49 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
   app.post('/api/services/:id/start', async (c) => {
     const id = c.req.param('id');
     const result = await pm.startService(id);
+    if (result.ok && result.pid) {
+      void notifyPolarBudgetRegister(id, result.pid, 'service_bg');
+    }
     return c.json(result, result.ok ? 200 : 500);
   });
 
   app.post('/api/services/:id/stop', async (c) => {
     const id = c.req.param('id');
     const result = await pm.stopService(id);
+    if (result.ok) {
+      void notifyPolarBudgetUnregister(id);
+    }
     return c.json(result, result.ok ? 200 : 500);
   });
 
   app.post('/api/services/:id/restart', async (c) => {
     const id = c.req.param('id');
     const result = await pm.restartService(id);
+    return c.json(result, result.ok ? 200 : 500);
+  });
+
+  app.post('/api/services/:id/stop-and-verify', async (c) => {
+    const id = c.req.param('id');
+    const svc = serviceDb.getService(id);
+    if (!svc) return c.json({ ok: false, message: `service ${id} not found` }, 404);
+    const body = await c.req.json().catch(() => ({})) as {
+      timeout_ms?: unknown;
+      clear_own_residual?: unknown;
+    };
+    const options: { timeout_ms?: number; clear_own_residual?: boolean } = {};
+    if (typeof body.timeout_ms === 'number') options.timeout_ms = body.timeout_ms;
+    if (typeof body.clear_own_residual === 'boolean') {
+      options.clear_own_residual = body.clear_own_residual;
+    }
+    const result = await pm.stopAndVerifyPort(id, options);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  app.post('/api/services/:id/restart-clean', async (c) => {
+    const id = c.req.param('id');
+    const svc = serviceDb.getService(id);
+    if (!svc) return c.json({ ok: false, message: `service ${id} not found` }, 404);
+    const result = await pm.restartClean(id);
     return c.json(result, result.ok ? 200 : 500);
   });
 
@@ -165,6 +225,130 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     if (!svc) return c.json({ ok: false, message: `service ${id} not found` }, 404);
     serviceDb.updateServiceRestartCount(id, 0);
     return c.json({ ok: true, message: `restart count reset for ${svc.name}` });
+  });
+
+  // ─── Processes (legacy SOTAgent compat + safe scoped kill) ───
+  app.get('/api/processes', (c) => {
+    const processes = pm.getAllStatus();
+    return c.json(processes);
+  });
+
+  app.get('/api/processes/:id', (c) => {
+    const id = c.req.param('id');
+    const proc = pm.getProcessById(id);
+    if (!proc) return c.json({ ok: false, message: `process ${id} not found` }, 404);
+    return c.json(proc);
+  });
+
+  app.post('/api/processes/:id/kill', async (c) => {
+    const id = c.req.param('id');
+    const svc = serviceDb.getService(id);
+    if (!svc) return c.json({ ok: false, message: `process ${id} not found` }, 404);
+    const result = await pm.killManagedProcess(id);
+    return c.json(result, result.ok ? 200 : 500);
+  });
+
+  // ─── Diagnostics (safe substitutes for lsof/kill/port-free checks) ───
+  app.get('/api/diagnostics/port-conflicts', async (c) => {
+    const conflicts = await pm.checkAllPortConflicts();
+    return c.json({ ok: true, conflicts });
+  });
+
+  app.get('/api/diagnostics/listening-ports', async (c) => {
+    const listeners = await pm.listListeningPorts();
+    return c.json({ ok: true, listeners, count: listeners.length });
+  });
+
+  app.get('/api/diagnostics/ports-batch', async (c) => {
+    const raw = c.req.query('ports') ?? '';
+    const ports = raw.split(/[,\s]+/).map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= 65535);
+    if (ports.length === 0) {
+      return c.json({ ok: false, message: 'ports query required (comma-separated)' }, 400);
+    }
+    if (ports.length > 50) {
+      return c.json({ ok: false, message: 'max 50 ports per batch request' }, 400);
+    }
+    const diagnostics = await pm.getBatchPortDiagnostics(ports);
+    return c.json({ ok: true, diagnostics });
+  });
+
+  app.get('/api/diagnostics/ports/:port', async (c) => {
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ ok: false, message: 'invalid port' }, 400);
+    }
+    try {
+      const diagnostic = await pm.getPortDiagnostic(port);
+      return c.json({ ok: true, ...diagnostic });
+    } catch (err) {
+      return c.json(
+        { ok: false, message: err instanceof Error ? err.message : String(err) },
+        400,
+      );
+    }
+  });
+
+  app.post('/api/diagnostics/ports/:port/clear-own', async (c) => {
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ ok: false, message: 'invalid port' }, 400);
+    }
+    const result = await pm.clearOwnPortOccupant(port);
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  app.post('/api/diagnostics/ports/:port/wait-free', async (c) => {
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ ok: false, message: 'invalid port' }, 400);
+    }
+    const body = await c.req.json().catch(() => ({})) as {
+      timeout_ms?: unknown;
+      interval_ms?: unknown;
+    };
+    const options: { timeout_ms?: number; interval_ms?: number } = {};
+    if (typeof body.timeout_ms === 'number') options.timeout_ms = body.timeout_ms;
+    if (typeof body.interval_ms === 'number') options.interval_ms = body.interval_ms;
+    const result = await pm.waitForPortFree(port, options);
+    return c.json(result, result.free ? 200 : 409);
+  });
+
+  app.post('/api/diagnostics/ports/:port/clear-and-verify', async (c) => {
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return c.json({ ok: false, message: 'invalid port' }, 400);
+    }
+    const result = await pm.clearOwnPortOccupantAndVerify(port);
+    return c.json(result, result.free ? 200 : 409);
+  });
+
+  app.get('/api/diagnostics/process/:pid', async (c) => {
+    const pid = Number(c.req.param('pid'));
+    if (!Number.isSafeInteger(pid) || pid <= 1) {
+      return c.json({ ok: false, message: 'invalid pid' }, 400);
+    }
+    const probe = await pm.probeProcess(pid);
+    return c.json({ ok: true, ...probe });
+  });
+
+  app.get('/api/services/:id/port-status', async (c) => {
+    const id = c.req.param('id');
+    const result = await pm.getServicePortStatus(id);
+    if ('ok' in result && result.ok === false && !('port' in result)) {
+      return c.json(result, 404);
+    }
+    if ('ok' in result && result.ok === false) {
+      return c.json(result, 400);
+    }
+    return c.json({ ok: true, ...(result as object) });
+  });
+
+  app.post('/api/services/:id/ensure-port-ready', async (c) => {
+    const id = c.req.param('id');
+    const svc = serviceDb.getService(id);
+    if (!svc) return c.json({ ok: false, message: `service ${id} not found` }, 404);
+    const result = await pm.ensureServicePortReady(id);
+    return c.json(result, result.ok ? 200 : 409);
   });
 
   app.post('/api/services/register', async (c) => {
@@ -298,6 +482,21 @@ async function registerCapabilities(port: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const proxySnapshot = bootstrapOutboundProxy(process.argv.slice(2));
+  if (proxySnapshot.applied) {
+    console.log(
+      `[PolarProcess] Outbound proxy enabled (${proxySnapshot.source}): HTTP_PROXY=${proxySnapshot.httpProxy ?? '-'} HTTPS_PROXY=${proxySnapshot.httpsProxy ?? '-'}`,
+    );
+  } else if (proxySnapshot.mode === 'off') {
+    console.log('[PolarProcess] Outbound proxy disabled (--no-proxy / POLAR_PROXY_MODE=off)');
+  } else if (proxySnapshot.source === 'existing') {
+    console.log(
+      `[PolarProcess] Outbound proxy inherited from environment: HTTP_PROXY=${proxySnapshot.httpProxy ?? '-'}`,
+    );
+  } else {
+    console.log('[PolarProcess] Outbound proxy not applied (no system proxy detected)');
+  }
+
   const db = new ProcessDB(DB_PATH);
 
   if (!existsSync(SHARED_DB_PATH)) {

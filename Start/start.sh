@@ -12,6 +12,20 @@ cd "$PROJECT_DIR"
 
 HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
 
+# Outbound proxy for managed services (Hub → cursor-agent). Default: on (read macOS system proxy).
+# Override: POLAR_PROXY_MODE=off|auto|on, --no-proxy, --proxy=auto
+POLAR_PROXY_MODE="${POLAR_PROXY_MODE:-on}"
+COMMAND="start"
+SERVER_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-proxy) POLAR_PROXY_MODE=off ;;
+        --proxy=*) POLAR_PROXY_MODE="${arg#--proxy=}" ;;
+        start|stop|restart|status) COMMAND="$arg" ;;
+        *) SERVER_ARGS+=("$arg") ;;
+    esac
+done
+
 # ── Node version alignment ──────────────────────────
 if [ -f ".nvmrc" ]; then
     REQUIRED_NODE=$(cat .nvmrc)
@@ -52,11 +66,18 @@ do_start() {
     TSX_BIN="$PROJECT_DIR/node_modules/.bin/tsx"
     echo "[start.sh] Using node: $NODE_BIN ($($NODE_BIN --version)) pinned port=$PORT" >> "$LOG_FILE"
 
-    if [ "${LAUNCHD:-}" = "1" ]; then
-        exec env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1
+    # Forward optional POLARPROCESS_SHARED_DB (recovery/tests). Avoid empty-array expand under `set -u`.
+    if [ -n "${POLARPROCESS_SHARED_DB:-}" ]; then
+        RUN_ENV=(env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" POLAR_PROXY_MODE="$POLAR_PROXY_MODE" POLARPROCESS_SHARED_DB="$POLARPROCESS_SHARED_DB")
+    else
+        RUN_ENV=(env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" POLAR_PROXY_MODE="$POLAR_PROXY_MODE")
     fi
 
-    nohup env NODE="$NODE_BIN" POLARPROCESS_PORT="$PORT" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1 &
+    if [ "${LAUNCHD:-}" = "1" ]; then
+        exec "${RUN_ENV[@]}" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1
+    fi
+
+    nohup "${RUN_ENV[@]}" "$NODE_BIN" "$TSX_BIN" src/server.ts >> "$LOG_FILE" 2>&1 &
     DAEMON_PID=$!
     echo "$DAEMON_PID" > "$PID_FILE"
 
@@ -138,14 +159,13 @@ do_status() {
     exit 1
 }
 
-COMMAND="${1:-start}"
 case "$COMMAND" in
     start)   do_start   ;;
     stop)    do_stop    ;;
     restart) do_restart ;;
     status)  do_status  ;;
     *)
-        echo "Usage: bash Start/start.sh [start|stop|restart|status]" >&2
+        echo "Usage: bash Start/start.sh [start|stop|restart|status] [--no-proxy] [--proxy=on|off|auto]" >&2
         exit 1
         ;;
 esac

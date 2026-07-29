@@ -68,6 +68,30 @@ export class ServiceDB {
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
+    // Multi-writer (PolarProcess + SOTAgent): wait instead of SQLITE_BUSY storms.
+    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('synchronous = NORMAL');
+    this.assertUsableSchema();
+  }
+
+  /** Fail fast on empty/quarantined DB rather than crash mid health-check. */
+  private assertUsableSchema(): void {
+    const required = ['shared_services', 'device_config', 'service_events'] as const;
+    for (const table of required) {
+      const row = this.db
+        .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name=?`)
+        .get(table) as { ok: number } | undefined;
+      if (!row) {
+        throw new Error(
+          `ServiceDB missing required table "${table}" — resources.sqlite is empty or unrestored`,
+        );
+      }
+    }
+    const integrityRows = this.db.pragma('integrity_check') as Array<Record<string, string>>;
+    const integrity = integrityRows[0] ? Object.values(integrityRows[0])[0] : 'unknown';
+    if (integrity !== 'ok') {
+      throw new Error(`ServiceDB integrity_check failed: ${integrity}`);
+    }
   }
 
   close(): void {
@@ -231,16 +255,24 @@ export class ServiceDB {
     detail?: string;
     restart_count?: number;
   }): void {
-    this.db.prepare(`
-      INSERT INTO service_events (service_id, service_name, event_type, detail, restart_count)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      params.service_id,
-      params.service_name,
-      params.event_type,
-      params.detail ?? null,
-      params.restart_count ?? null,
-    );
+    // Observability must never take down PolarProcess (SQLITE_CORRUPT / CHECK / BUSY).
+    try {
+      this.db.prepare(`
+        INSERT INTO service_events (service_id, service_name, event_type, detail, restart_count)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        params.service_id,
+        params.service_name,
+        params.event_type,
+        params.detail ?? null,
+        params.restart_count ?? null,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[ServiceDB] logServiceEvent dropped (${params.event_type} ${params.service_id}): ${message}`,
+      );
+    }
   }
 
   upsertDevice(params: {

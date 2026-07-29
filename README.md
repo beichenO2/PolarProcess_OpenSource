@@ -93,6 +93,7 @@ PolarProcess/
 │   ├── scheduler.ts             # 重任务队列 + 分时复用
 │   ├── profiler.ts              # CPU/内存/GPU 资源画像采样
 │   ├── command-guard.ts         # 启动命令白名单 + 路径规范化
+│   ├── proxy-env.ts             # macOS 系统代理 → 托管服务 outbound env
 │   ├── tailscale-client.ts      # 跨设备 Tailscale IP 发现
 │   ├── service-db.ts            # 共享 ServiceDB（SOTAgent resources.sqlite）
 │   ├── db.ts                    # 本地 ProcessDB（任务/调度状态）
@@ -119,6 +120,25 @@ Agent / 脚本 ──POST /api/services/:id/restart──▶ PolarProcess (:1105
                     SOTAgent console (:4880) ◀──facade 只读──────┘
                               │
                        lobster-events.jsonl ──▶ PolarPilot Agentic 自愈
+```
+
+---
+
+## Outbound 代理（托管服务 → cursor-agent 等）
+
+Clash / 系统代理环境下，**Cursor IDE** 会自动走代理，但 **`cursor-agent` CLI** 需要 `HTTP_PROXY` / `HTTPS_PROXY`（[官方 CLI 文档](https://cursor.com/docs/cli/reference/configuration)）。PolarProcess 在启动时读取 macOS `scutil --proxy`，注入自身 `process.env`，**所有** `ProcessManager` spawn 的服务（含 `polarcop-hub` → Hub spawn 的 cursor-agent）自动继承，**不修改**用户全局 shell profile。
+
+| 开关 | 说明 |
+|------|------|
+| 默认 `on` | 读系统代理并注入 |
+| `--no-proxy` / `POLAR_PROXY_MODE=off` | 不注入 |
+| `--proxy=auto` | 仅当 `HTTP_PROXY` 未设置时注入 |
+| `POLAR_HTTP_PROXY` / `POLAR_HTTPS_PROXY` | 手动覆盖系统代理 |
+
+```bash
+bash Start/start.sh restart              # 默认启用代理
+bash Start/start.sh restart --no-proxy   # 关闭
+curl http://127.0.0.1:11055/api/runtime/proxy
 ```
 
 ---
