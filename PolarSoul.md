@@ -24,7 +24,8 @@ PolarProcess 是 Polarisor 的**进程生命周期管理器与守护者**。它�
 
 ## 与其他项目的关系
 
-- **与 SOTAgent 互补**: SOTAgent 是服务发现/端口分配的注册中心（port 4800），PolarProcess 是实际执行启停和守护的进程管理器（port 11055）
+- **PolarManager 三巨头之一**: PolarPort + PolarProcess + PolarBudget 合称 PolarManager；Process 负责生命周期，启停后向 PolarBudget 注册/注销 PID 以供护核
+- **与 SOTAgent 互补**: SOTAgent 是观测面板（console），不是启停权威；端口权威是 PolarPort（:11050），进程权威是 PolarProcess（:11055）
 - **与 PolarPilot Daemon 不同**: PolarPilot Daemon 监控"代码是否编译通过"，PolarProcess 监控"进程是否在跑"
 - **自身不可守护**: PolarProcess 自己崩溃时无法自愈——需依赖 launchd 或 systemd 作为最外层看门人
 

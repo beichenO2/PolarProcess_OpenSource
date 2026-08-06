@@ -12,6 +12,13 @@ import * as net from 'node:net'
 
 export interface WatchdogTarget {
   name: string
+  /**
+   * Directory the target was discovered in. `restart_command` is written relative to the
+   * project ("bash Start/start.sh"), so it has to run there; inheriting PolarProcess's own
+   * cwd made every restart die with 127 and no service ever recovered. The directory cannot
+   * be derived from `name` either — PolarClock lives in `Clock`.
+   */
+  dir: string
   healthEndpoint: string
   restartCommand: string
   failures: number
@@ -94,6 +101,7 @@ export class Watchdog {
         validNames.add(name)
         this.targets.set(name, {
           name,
+          dir: join(root, entry.name),
           healthEndpoint: sm.health_endpoint,
           restartCommand: sm.restart_command || '',
           failures: 0,
@@ -292,7 +300,7 @@ export class Watchdog {
     try {
       const { exec } = await import('node:child_process')
       await new Promise<void>((resolve, reject) => {
-        exec(target.restartCommand, { timeout: 30_000 }, (err) => {
+        exec(target.restartCommand, { cwd: target.dir, timeout: 30_000 }, (err) => {
           if (err) reject(err); else resolve()
         })
       })

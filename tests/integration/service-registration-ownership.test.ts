@@ -56,6 +56,40 @@ describe('service registration ownership', () => {
     expect(serviceDb.getService('active-registration-test')?.work_dir).toBe(TEST_DIR);
   });
 
+  // Nothing used to clear last_error: a service that came up clean still carried the
+  // message from whatever failed hours earlier, and the watchdog marking it `error`
+  // later adds no message of its own — so the stale one is what every consumer shows
+  // as the reason. Two debugging sessions on a downstream project read that tombstone
+  // as current news and went looking for a config path nothing had touched since.
+  it('a service that comes up clean stops reporting the last failure', () => {
+    serviceDb.registerService({
+      id: 'stale-error-test',
+      name: 'Stale Error Test',
+      command: 'sleep 30',
+      work_dir: TEST_DIR,
+      device_id: 'any',
+      start_script_dir: '-',
+    });
+    serviceDb.updateServiceStatus('stale-error-test', 'error', {
+      last_error: 'unreadable config: /etc/taoci/taoci.env',
+      last_exit_code: 1,
+    });
+    expect(serviceDb.getService('stale-error-test')?.last_error).toMatch(/unreadable config/);
+
+    serviceDb.updateServiceStatus('stale-error-test', 'running', { pid: 2_147_483_647 });
+
+    const started = serviceDb.getService('stale-error-test');
+    expect(started?.last_error ?? null).toBeNull();
+    expect(started?.last_exit_code ?? null).toBeNull();
+
+    // And a caller that does have something to say about this start still wins.
+    serviceDb.updateServiceStatus('stale-error-test', 'running', {
+      pid: 2_147_483_647,
+      last_error: 'adopted an orphan on the port',
+    });
+    expect(serviceDb.getService('stale-error-test')?.last_error).toBe('adopted an orphan on the port');
+  });
+
   it('allows idempotent registration while a service is active', () => {
     const pm = new ProcessManager(serviceDb, {});
     const result = pm.registerService({

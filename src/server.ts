@@ -17,6 +17,7 @@ import { ResourceScheduler } from './scheduler.js';
 import { ResourceProfiler } from './profiler.js';
 import { Watchdog } from './watchdog.js';
 import { bootstrapOutboundProxy, getProxyEnvSnapshot } from './proxy-env.js';
+import { installExitForensics } from './exit-forensics.js';
 import {
   notifyPolarBudgetRegister,
   notifyPolarBudgetUnregister,
@@ -360,6 +361,29 @@ export function createApp(db: ProcessDB, serviceDb: ServiceDB): PolarProcessApp 
     return c.json(result, result.ok ? 200 : 409);
   });
 
+  /** Explicit deregister (stop then delete). Non-ephemeral requires body.confirm === id. */
+  app.delete('/api/services/:id', async (c) => {
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => ({})) as { confirm?: unknown };
+    const confirm = typeof body.confirm === 'string' ? body.confirm : undefined;
+    const result = await pm.unregisterService(id, { confirm });
+    if (!result.ok && result.message.includes('not found')) {
+      return c.json(result, 404);
+    }
+    return c.json(result, result.ok ? 200 : 409);
+  });
+
+  /**
+   * GC ephemeral cursor-cli- / rr-cursor- rows that are error/stopped and missing start scripts.
+   * dry_run defaults to true (safe).
+   */
+  app.post('/api/services/sweep-ephemeral', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { dry_run?: unknown };
+    const dry_run = body.dry_run !== false;
+    const result = await pm.sweepEphemeral({ dry_run });
+    return c.json(result);
+  });
+
   app.post('/api/services/register-and-start', async (c) => {
     const body = await c.req.json();
     if (!body.id || !body.name || !body.command) {
@@ -482,6 +506,7 @@ async function registerCapabilities(port: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  installExitForensics();
   const proxySnapshot = bootstrapOutboundProxy(process.argv.slice(2));
   if (proxySnapshot.applied) {
     console.log(

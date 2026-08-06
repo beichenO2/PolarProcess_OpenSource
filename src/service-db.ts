@@ -138,6 +138,12 @@ export class ServiceDB {
     );
   }
 
+  /** Hard-delete a registry row. Caller must stop the process first. */
+  deleteService(id: string): boolean {
+    const result = this.db.prepare('DELETE FROM shared_services WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
   listServices(deviceId?: string): ISharedServiceRow[] {
     if (deviceId) {
       return this.db.prepare(
@@ -168,7 +174,16 @@ export class ServiceDB {
   }): void {
     const sets = ['status = ?'];
     const vals: unknown[] = [status];
-    if (status === 'running') sets.push("started_at = datetime('now')");
+    if (status === 'running') {
+      sets.push("started_at = datetime('now')");
+      // A service that is up has no last error. Leaving the previous one in place
+      // makes it read as news: consumers show it as the reason the service is
+      // unwell, and `error` set later by the watchdog carries no message of its
+      // own, so the stale one is what everybody sees. An explicit last_error in
+      // `extra` still wins — see below.
+      if (extra?.last_error === undefined) { sets.push('last_error = NULL'); }
+      if (extra?.last_exit_code === undefined) { sets.push('last_exit_code = NULL'); }
+    }
     if (status === 'starting' && extra?.pid == null) sets.push('pid = NULL');
     if (status === 'stopped') {
       sets.push('pid = NULL');

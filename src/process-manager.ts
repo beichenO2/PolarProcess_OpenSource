@@ -21,6 +21,7 @@ import type { ServiceDB, ISharedServiceRow, IServiceRegistrationParams } from '.
 import { getPeerTailscaleIP } from './tailscale-client.js';
 const SOTAGENT_API_PORT = Number(process.env.SOTAGENT_API_PORT ?? 4800);
 import { validateCommand, normalizeCommand } from './command-guard.js';
+import { watchdogLogDedup } from './log-dedup.js';
 
 
 export interface IProcessManagerConfig {
@@ -627,6 +628,91 @@ export class ProcessManager {
     return { ok: true, id: params.id, message: `service ${params.name} registered` };
   }
 
+  /**
+   * Ephemeral agent/cli registrations that are safe to GC when dead + missing scripts.
+   * Persistent project services must never match.
+   */
+  static isEphemeralServiceId(id: string): boolean {
+    return /^(cursor-cli-|rr-cursor-)/.test(id);
+  }
+
+  static ephemeralStartScriptMissing(svc: ISharedServiceRow): boolean {
+    const workDir = svc.work_dir?.trim() || '';
+    if (!workDir || !fs.existsSync(workDir)) return true;
+    const scriptDir = (svc.start_script_dir?.trim() || 'Start').replace(/^\.\//, '');
+    const startSh = path.join(workDir, scriptDir, 'start.sh');
+    const startShAlt = path.join(workDir, 'Start', 'start.sh');
+    return !fs.existsSync(startSh) && !fs.existsSync(startShAlt);
+  }
+
+  /** Stop (best-effort) then remove registry row. Non-ephemeral requires confirm === id. */
+  async unregisterService(
+    serviceId: string,
+    opts: { confirm?: string; force_ephemeral?: boolean } = {},
+  ): Promise<IServiceActionResult & { deleted?: boolean }> {
+    const svc = this.db.getService(serviceId);
+    if (!svc) return { ok: false, message: `service ${serviceId} not found` };
+
+    const ephemeral = ProcessManager.isEphemeralServiceId(serviceId);
+    if (!ephemeral && opts.confirm !== serviceId) {
+      return {
+        ok: false,
+        message: `refusing to delete non-ephemeral service ${serviceId}; pass confirm=${serviceId}`,
+      };
+    }
+
+    if (svc.status === 'running' || svc.status === 'starting' || this.childProcesses.has(serviceId)) {
+      await this.stopService(serviceId);
+    }
+
+    const deleted = this.db.deleteService(serviceId);
+    this.childProcesses.delete(serviceId);
+    return {
+      ok: deleted,
+      deleted,
+      message: deleted
+        ? `service ${serviceId} unregistered`
+        : `service ${serviceId} not deleted`,
+    };
+  }
+
+  listEphemeralSweepCandidates(): ISharedServiceRow[] {
+    return this.db.listServices().filter((svc) => {
+      if (!ProcessManager.isEphemeralServiceId(svc.id)) return false;
+      if (svc.status === 'running' || svc.status === 'starting') return false;
+      if (!['error', 'stopped'].includes(svc.status)) return false;
+      return ProcessManager.ephemeralStartScriptMissing(svc);
+    });
+  }
+
+  async sweepEphemeral(opts: { dry_run?: boolean } = {}): Promise<{
+    ok: true;
+    dry_run: boolean;
+    candidates: string[];
+    deleted: string[];
+    failed: Array<{ id: string; message: string }>;
+  }> {
+    const dryRun = opts.dry_run !== false; // default true
+    const candidates = this.listEphemeralSweepCandidates();
+    const ids = candidates.map((c) => c.id);
+    if (dryRun) {
+      return { ok: true, dry_run: true, candidates: ids, deleted: [], failed: [] };
+    }
+    const deleted: string[] = [];
+    const failed: Array<{ id: string; message: string }> = [];
+    for (const id of ids) {
+      // Re-check predicate inside the loop (Eureka-style re-query before eviction).
+      const fresh = this.db.getService(id);
+      if (!fresh || !ProcessManager.isEphemeralServiceId(id)) continue;
+      if (fresh.status === 'running' || fresh.status === 'starting') continue;
+      if (!ProcessManager.ephemeralStartScriptMissing(fresh)) continue;
+      const result = await this.unregisterService(id, { force_ephemeral: true });
+      if (result.ok) deleted.push(id);
+      else failed.push({ id, message: result.message });
+    }
+    return { ok: true, dry_run: false, candidates: ids, deleted, failed };
+  }
+
   async startService(serviceId: string): Promise<IServiceActionResult> {
     if (this.startInFlight.has(serviceId)) {
       return { ok: false, message: `服务 ${serviceId} 已在启动中` };
@@ -858,8 +944,16 @@ export class ProcessManager {
             }
 
             const exitStatus = diagnosis.cause === 'clean_exit' ? 'stopped' : 'error';
-            console.log(`[Watchdog] 服务 ${freshSvc.name} 退出 (code=${code}, signal=${signal}) — 死因: ${diagnosis.cause} → ${exitStatus}`);
-            if (diagnosis.detail) console.log(`[Watchdog]   ↳ ${diagnosis.detail}`);
+            watchdogLogDedup.emit(
+              `exit:${serviceId}:${diagnosis.cause}`,
+              `[Watchdog] 服务 ${freshSvc.name} 退出 (code=${code}, signal=${signal}) — 死因: ${diagnosis.cause} → ${exitStatus}`,
+            );
+            if (diagnosis.detail) {
+              watchdogLogDedup.emit(
+                `exit-detail:${serviceId}:${diagnosis.cause}`,
+                `[Watchdog]   ↳ ${diagnosis.detail}`,
+              );
+            }
 
             this.db.updateServiceStatus(serviceId, exitStatus as any, {
               last_exit_code: code ?? undefined,
@@ -1038,7 +1132,10 @@ export class ProcessManager {
         }
 
         // Port bound by different process
-        console.error(`[PortVerify] ❌ ${serviceName}: 端口 ${port} 被 pid=${occupant.pid} 占用，不是期望的 pid=${pid}`);
+        watchdogLogDedup.emit(
+          `portverify:${serviceId}:${port}:${occupant.pid}`,
+          `[PortVerify] ❌ ${serviceName}: 端口 ${port} 被 pid=${occupant.pid} 占用，不是期望的 pid=${pid}`,
+        );
         this.db.logServiceEvent({
           service_id: serviceId, service_name: serviceName,
           event_type: 'health_fail',
@@ -1916,7 +2013,10 @@ export class ProcessManager {
     }
 
     // ─── 第三方占用 → 自动迁移端口 ─────────────────────────
-    console.log(`[Watchdog] 端口 ${port} 被第三方进程占用 (pid=${occupant.pid}, cmd=${occupant.command.slice(0, 80)})`);
+    watchdogLogDedup.emit(
+      `thirdparty:${serviceId}:${port}:${occupant.pid}`,
+      `[Watchdog] 端口 ${port} 被第三方进程占用 (pid=${occupant.pid}, cmd=${occupant.command.slice(0, 80)})`,
+    );
     const newPort = await this.claimPortFromPolarPort({
       service_name: svc.id || svc.name,
       project: this.resolveProject(svc),
@@ -1930,7 +2030,10 @@ export class ProcessManager {
       };
     }
 
-    console.log(`[Watchdog] ⚡ 自动迁移端口: ${svc.name} ${port} → ${newPort} (原端口被 pid=${occupant.pid} 占用)`);
+    watchdogLogDedup.emit(
+      `migrate:${serviceId}:${port}:${newPort}`,
+      `[Watchdog] ⚡ 自动迁移端口: ${svc.name} ${port} → ${newPort} (原端口被 pid=${occupant.pid} 占用)`,
+    );
     this.db.updateServiceStatus(serviceId, svc.status, { port: newPort });
     this.db.logServiceEvent({
       service_id: serviceId,
@@ -2044,7 +2147,10 @@ export class ProcessManager {
       return false;
     }
 
-    console.log(`[Watchdog] ⚡ 自动迁移端口: ${svc.name} ${svc.port} → ${newPort} (原端口被 pid=${occupant.pid} 占用: ${occupant.command.slice(0, 60)})`);
+    watchdogLogDedup.emit(
+      `migrate2:${serviceId}:${svc.port}:${newPort}`,
+      `[Watchdog] ⚡ 自动迁移端口: ${svc.name} ${svc.port} → ${newPort} (原端口被 pid=${occupant.pid} 占用: ${occupant.command.slice(0, 60)})`,
+    );
     this.db.updateServiceStatus(serviceId, 'stopped', { port: newPort });
     this.db.logServiceEvent({
       service_id: serviceId,
