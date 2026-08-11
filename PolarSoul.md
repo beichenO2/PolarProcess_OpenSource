@@ -20,13 +20,13 @@ PolarProcess 是 Polarisor 的**进程生命周期管理器与守护者**。它�
 | R3 | 多设备编排 | 通过 device_id + Tailscale IP 将进程启动请求路由到正确设备 |
 | R4 | Command Guard | 启动命令白名单验证 + 路径规范化，防止命令注入 |
 | R5 | Scheduler | 定时任务管理（如定期爬取触发） |
-| R6 | Crash Loop 检测 | 5 分钟窗口内重启 >= 10 次时放弃，发 lobster-event 通知 PolarPilot |
+| R6 | Crash Loop 检测 | 5 分钟窗口内重启 >= 10 次时放弃，发 lobster-event 供下游消费 |
 
 ## 与其他项目的关系
 
 - **PolarManager 三巨头之一**: PolarPort + PolarProcess + PolarBudget 合称 PolarManager；Process 负责生命周期，启停后向 PolarBudget 注册/注销 PID 以供护核
 - **与 SOTAgent 互补**: SOTAgent 是观测面板（console），不是启停权威；端口权威是 PolarPort（:11050），进程权威是 PolarProcess（:11055）
-- **与 PolarPilot Daemon 不同**: PolarPilot Daemon 监控"代码是否编译通过"，PolarProcess 监控"进程是否在跑"
+- **lobster-event 消费方**: 原消费方 PolarPilot 已于 2026-08-11 退役（见根仓 ARCHIVED.md）；事件仍写入 `lobster-events.jsonl` 供后续接入者消费
 - **自身不可守护**: PolarProcess 自己崩溃时无法自愈——需依赖 launchd 或 systemd 作为最外层看门人
 
 ## 关键设计决策

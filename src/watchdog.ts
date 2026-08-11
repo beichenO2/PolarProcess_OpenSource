@@ -3,10 +3,11 @@
  *
  * Periodically health-checks all registered services. If a service fails
  * health checks repeatedly, it restarts it. After exhaust restarts,
- * emits a lobster-event for PolarPilot Agentic healing.
+ * emits a lobster-event for downstream Agentic healing consumers.
+ * (PolarPilot, the original consumer, retired 2026-08-11 — see root ARCHIVED.md.)
  */
 
-import { readFileSync, readdirSync, appendFileSync, existsSync } from 'node:fs'
+import { readFileSync, readdirSync, appendFileSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import * as net from 'node:net'
 
@@ -85,7 +86,14 @@ export class Watchdog {
     const validNames = new Set<string>()
 
     for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue
+      // PolarManager monorepo keeps top-level compatibility symlinks
+      // (e.g. ~/Polarisor/PolarBudget -> PolarManager/packages/budget);
+      // stat() follows the link so those projects stay under watch.
+      let isDir = entry.isDirectory()
+      if (!isDir && entry.isSymbolicLink()) {
+        try { isDir = statSync(join(root, entry.name)).isDirectory() } catch { isDir = false }
+      }
+      if (!isDir) continue
       if (isAuthorityProject(entry.name)) continue
       const polarisPath = join(root, entry.name, 'polaris.json')
       if (!existsSync(polarisPath)) continue

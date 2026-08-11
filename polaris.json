@@ -199,7 +199,7 @@
     {
       "id": "R3",
       "need": "Watchdog 进程监控 — 自动检测+重启+crash loop 保护",
-      "approach": "Watchdog 定时健康检查所有项目的 health_endpoint，连续失败自动重启，重启耗尽发 lobster-event 触发 PolarPilot Agentic 自愈",
+      "approach": "Watchdog 定时健康检查所有项目的 health_endpoint，连续失败自动重启，重启耗尽发 lobster-event 交下游 Agentic 自愈",
       "features": [
         {
           "name": "GET /api/watchdog/status — 所有监控目标状态",

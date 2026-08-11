@@ -15,7 +15,7 @@ SOTAgent 擅长观测面板与 Git 同步，但不适合同时承担进程 spawn
 | 端口分配 | [PolarPort](https://github.com/beichenO2/PolarPort)（:11050），本服务只消费 |
 | 前端展示 | SOTAgent console（:4880），只读 |
 
-**Watchdog 目标发现**：扫描 `~/Polarisor/*/polaris.json` 的 `service_management.health_endpoint`（跳过 archived/deprecated）。连续 3 次失败自动执行 `restart_command`；5 分钟内 ≥10 次重启判定 crash loop，停止机械重启并发 lobster-event 交 PolarPilot Agentic 修复。**因此各项目 `health_endpoint` 的端口必须与实际监听一致**，写错会被误判反复重启。
+**Watchdog 目标发现**：扫描 `~/Polarisor/*/polaris.json` 的 `service_management.health_endpoint`（跳过 archived/deprecated）。连续 3 次失败自动执行 `restart_command`；5 分钟内 ≥10 次重启判定 crash loop，停止机械重启并发 lobster-event 交下游 Agentic 修复。**因此各项目 `health_endpoint` 的端口必须与实际监听一致**，写错会被误判反复重启。
 
 > 端口冲突迁移走 PolarPort `/api/allocate`（`ProcessManager.claimPortFromPolarPort`）。`ServiceDB.allocatePort` 已废弃并会抛错，避免双事实源。
 
@@ -119,7 +119,7 @@ Agent / 脚本 ──POST /api/services/:id/restart──▶ PolarProcess (:1105
                     PolarPort (:11050) ◀──stale sweep / release──┤
                     SOTAgent console (:4880) ◀──facade 只读──────┘
                               │
-                       lobster-events.jsonl ──▶ PolarPilot Agentic 自愈
+                       lobster-events.jsonl ──▶ 下游 Agentic 自愈消费方
 ```
 
 ---
@@ -183,8 +183,9 @@ curl http://127.0.0.1:11055/api/health
 | [PolarPort](https://github.com/beichenO2/PolarPort) | 端口分配唯一权威与 stale 端口联动 | 必须 |
 | [SOTAgent](https://github.com/beichenO2/SOTAgent) | ServiceDB 共享存储 + console 前端展示（非操作权威） | 必须 |
 | [Agent_core](https://github.com/beichenO2/Agent_core) | P27 硬约束与 Skill 集成（`pc-yolo-execute` 等） | 推荐 |
-| [PolarPilot](https://github.com/beichenO2/PolarPilot) | 消费 `lobster-events.jsonl` 触发 Agentic 自愈 | 推荐 |
 | [PolarCopilot](https://github.com/beichenO2/PolarCopilot) | Hub Console 进程视图 embed | 可选 |
+
+> `lobster-events.jsonl` 的原消费方 PolarPilot 已于 2026-08-11 退役（见根仓 ARCHIVED.md），事件继续落盘等待新接入者。
 
 ---
 
