@@ -30,6 +30,10 @@ data/
 .sotagent-outbox/
 任务书/
 _reports/
+_report/
+_design/
+*.bak
+*.bak-*
 knowledge/crystals/
 
 # Build Artifacts
