@@ -27,7 +27,6 @@ data/
 
 # Internal Planning & Management
 .planning/
-.sotagent-outbox/
 任务书/
 _reports/
 _report/
